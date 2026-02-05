@@ -1,0 +1,23 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./service-manager.db"
+}
+
+model Service {
+  id            String   @id @default(cuid())
+  name          String
+  description   String?
+  command       String   // The batch file content or command to run
+  startOnBoot   Boolean  @default(false)
+  
+  // Runtime state - persisted to survive restarts
+  pid           Int?     // Process ID when running
+  status        String   @default("stopped") // running, stopped, starting, error
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
