@@ -34,7 +34,9 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    if (pids.size === 0) {
+    const pidArray = Array.from(pids)
+    
+    if (pidArray.length === 0) {
       return NextResponse.json({ message: `No process found on port ${port}` }, { status: 404 })
     }
 
@@ -42,7 +44,7 @@ export async function POST(request: NextRequest) {
     const killedPids: string[] = []
     const errors: string[] = []
 
-    for (const pid of pids) {
+    for (const pid of pidArray) {
       try {
         await execAsync(`taskkill /PID ${pid} /T /F`)
         killedPids.push(pid)

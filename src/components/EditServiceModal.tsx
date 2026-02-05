@@ -76,15 +76,15 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
   if (!isOpen || !service) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
       <div 
         className="absolute inset-0 bg-black/70 backdrop-blur-sm"
         onClick={onClose}
       />
       
-      {/* Modal */}
-      <div className="relative w-full max-w-2xl card p-6 animate-slide-up">
+      {/* Modal - full screen with small margin */}
+      <div className="absolute inset-4 card p-6 animate-slide-up overflow-y-auto">
         <div className="flex items-center justify-between mb-6">
           <h2 className="text-xl font-semibold text-zinc-100">Edit Service</h2>
           <button onClick={onClose} className="btn-ghost p-2">
@@ -125,7 +125,7 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
             <textarea
               value={formData.command}
               onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-              className="textarea-field w-full h-56"
+              className="textarea-field w-full h-[50vh]"
               placeholder="echo Hello World"
               required
             />

@@ -32,6 +32,18 @@ export default function Home() {
     }
   }, [])
 
+  // Trigger auto-start services on initial page load
+  useEffect(() => {
+    const triggerStartup = async () => {
+      try {
+        await fetch('/api/services/startup', { method: 'POST' })
+      } catch (error) {
+        console.error('Failed to trigger startup services:', error)
+      }
+    }
+    triggerStartup()
+  }, []) // Only run once on mount
+
   useEffect(() => {
     fetchServices()
     // Poll for updates every 2 seconds

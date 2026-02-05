@@ -2,12 +2,15 @@ import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
 import { processManager } from '@/lib/process-manager'
 
-// Initialize process manager state from database on first request
-let initialized = false
+// Store initialized flag globally to survive hot-reloads
+const globalForInit = globalThis as unknown as { processManagerInitialized: boolean }
+if (globalForInit.processManagerInitialized === undefined) {
+  globalForInit.processManagerInitialized = false
+}
 
 async function initializeProcessManager() {
-  if (initialized) return
-  initialized = true
+  if (globalForInit.processManagerInitialized) return
+  globalForInit.processManagerInitialized = true
   
   const services = await prisma.service.findMany()
   for (const service of services) {

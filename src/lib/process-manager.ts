@@ -18,16 +18,20 @@ export interface ServiceProcess {
   error?: string
 }
 
+// Store instance globally to survive hot-reloads in development
+const globalForProcessManager = globalThis as unknown as {
+  processManagerInstance: ProcessManager | undefined
+}
+
 class ProcessManager extends EventEmitter {
   private processes: Map<string, ServiceProcess> = new Map()
-  private static instance: ProcessManager | null = null
   private maxOutputLines = 1000
 
   static getInstance(): ProcessManager {
-    if (!ProcessManager.instance) {
-      ProcessManager.instance = new ProcessManager()
+    if (!globalForProcessManager.processManagerInstance) {
+      globalForProcessManager.processManagerInstance = new ProcessManager()
     }
-    return ProcessManager.instance
+    return globalForProcessManager.processManagerInstance
   }
 
   getStatus(serviceId: string): ServiceProcess | undefined {
@@ -40,6 +44,12 @@ class ProcessManager extends EventEmitter {
 
   // Restore a service's runtime state from database (called on startup)
   restoreFromDb(serviceId: string, pid: number | null, status: ServiceStatus): void {
+    // Skip if we already have this service tracked with output
+    const existing = this.processes.get(serviceId)
+    if (existing && existing.output.length > 0) {
+      return // Don't overwrite existing output
+    }
+    
     if (pid && status === 'running') {
       // Check if the process is still actually running
       if (this.isProcessRunning(pid)) {
@@ -47,7 +57,7 @@ class ProcessManager extends EventEmitter {
           id: serviceId,
           process: null, // We don't have the ChildProcess object, but we have the PID
           status: 'running',
-          output: ['[Restored from previous session]'],
+          output: existing?.output || ['[Restored from previous session]'],
           pid,
         })
       } else {
@@ -56,7 +66,7 @@ class ProcessManager extends EventEmitter {
           id: serviceId,
           process: null,
           status: 'stopped',
-          output: ['[Previous process no longer running]'],
+          output: existing?.output || ['[Previous process no longer running]'],
         })
       }
     }

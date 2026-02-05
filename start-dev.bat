@@ -20,4 +20,8 @@ if not exist "prisma\service-manager.db" (
 :: Start the service manager in dev mode
 echo Starting Service Manager in development mode...
 echo.
+
+:: Open browser after a short delay
+start /b cmd /c "timeout /t 3 /nobreak > nul && start "" http://localhost:4000"
+
 npm run dev
