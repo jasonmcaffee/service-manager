@@ -1,5 +1,7 @@
 import { processManager, ServiceStatus } from '@/lib/process-manager'
 import { serviceRepository, CreateServiceInput, UpdateServiceInput } from '@/lib/repositories/serviceRepository'
+import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
+import { ensureDefaultProfile } from '@/lib/services/runProfileService'
 import { killPort } from '@/lib/util/portHelper'
 
 const globalForInit = globalThis as unknown as { processManagerInitialized: boolean }
@@ -7,6 +9,8 @@ const globalForInit = globalThis as unknown as { processManagerInitialized: bool
 async function initializeIfNeeded() {
   if (globalForInit.processManagerInitialized) return
   globalForInit.processManagerInitialized = true
+
+  await ensureDefaultProfile()
 
   const services = await serviceRepository.findAll()
   for (const service of services) {
@@ -25,10 +29,14 @@ function makeOnStateChange(id: string) {
   }
 }
 
-function buildEnv(service: { port?: number | null; cudaDevice?: string | null }): Record<string, string> {
+async function buildEnvForService(serviceId: string, port: number | null | undefined): Promise<Record<string, string>> {
   const env: Record<string, string> = {}
-  if (service.port) env.PORT = String(service.port)
-  if (service.cudaDevice) env.CUDA_DEVICE = service.cudaDevice
+  if (port) env.PORT = String(port)
+  const active = await runProfileRepository.findActive()
+  if (active) {
+    const override = await runProfileRepository.findProfileService(active.id, serviceId)
+    if (override?.cudaDevice) env.CUDA_DEVICE = override.cudaDevice
+  }
   return env
 }
 
@@ -38,6 +46,17 @@ function validatePort(port: number | null | undefined) {
     const err = new Error('Port must be an integer between 1 and 65535')
     ;(err as any).statusCode = 400
     throw err
+  }
+}
+
+async function mergeProfileOverride(service: any) {
+  const active = await runProfileRepository.findActive()
+  if (!active) return { ...service, cudaDevice: null, startOnBoot: false }
+  const override = await runProfileRepository.findProfileService(active.id, service.id)
+  return {
+    ...service,
+    cudaDevice: override?.cudaDevice ?? null,
+    startOnBoot: override?.startOnBoot ?? false,
   }
 }
 
@@ -63,7 +82,8 @@ export const serviceService = {
         pid = mem.pid
       }
 
-      return { ...service, status, pid }
+      const merged = await mergeProfileOverride(service)
+      return { ...merged, status, pid }
     }))
   },
 
@@ -72,8 +92,9 @@ export const serviceService = {
     if (!service) return null
 
     const mem = processManager.getStatus(id)
+    const merged = await mergeProfileOverride(service)
     return {
-      ...service,
+      ...merged,
       status: mem?.status ?? service.status,
       pid: mem?.pid ?? service.pid ?? null,
       output: mem?.output || [],
@@ -82,7 +103,20 @@ export const serviceService = {
 
   async createService(input: CreateServiceInput) {
     validatePort(input.port)
-    return serviceRepository.create(input)
+    const service = await serviceRepository.create(input)
+
+    // Create RunProfileService rows for all existing profiles
+    const active = await runProfileRepository.findActive()
+    await runProfileRepository.createProfileServicesForAllProfiles(service.id, {
+      cudaDevice: input.cudaDevice ?? null,
+      startOnBoot: input.startOnBoot ?? false,
+    })
+
+    if (active) {
+      const override = await runProfileRepository.findProfileService(active.id, service.id)
+      return { ...service, cudaDevice: override?.cudaDevice ?? null, startOnBoot: override?.startOnBoot ?? false }
+    }
+    return service
   },
 
   async updateService(id: string, input: UpdateServiceInput) {
@@ -105,7 +139,8 @@ export const serviceService = {
       pid: currentPid,
     })
 
-    return { ...updated, status: currentStatus, pid: currentPid }
+    const merged = await mergeProfileOverride(updated)
+    return { ...merged, status: currentStatus, pid: currentPid }
   },
 
   async deleteService(id: string) {
@@ -123,7 +158,8 @@ export const serviceService = {
       throw err
     }
 
-    await processManager.startService(service.id, service.command, buildEnv(service), makeOnStateChange(id))
+    const env = await buildEnvForService(id, service.port)
+    await processManager.startService(service.id, service.command, env, makeOnStateChange(id))
 
     const mem = processManager.getStatus(id)
     const updated = await serviceRepository.findById(id)
@@ -145,7 +181,6 @@ export const serviceService = {
     const onStateChange = makeOnStateChange(id)
     await processManager.stopService(id, onStateChange)
 
-    // Port-based fallback if PID kill didn't work
     if (processManager.isRunning(id) && service.port) {
       await killPort(service.port)
       await onStateChange('stopped', undefined)
@@ -167,7 +202,8 @@ export const serviceService = {
       throw err
     }
 
-    await processManager.restartService(service.id, service.command, buildEnv(service), makeOnStateChange(id))
+    const env = await buildEnvForService(id, service.port)
+    await processManager.restartService(service.id, service.command, env, makeOnStateChange(id))
 
     const mem = processManager.getStatus(id)
     const updated = await serviceRepository.findById(id)
@@ -184,20 +220,29 @@ export const serviceService = {
     }
     processManager.markBootStarted()
 
-    const services = await serviceRepository.findAutoStart()
+    await ensureDefaultProfile()
+    const active = await runProfileRepository.findActive()
+    if (!active) return { alreadyStarted: false, results: [] }
+
+    const autoStartEntries = await runProfileRepository.findAutoStartServices(active.id)
     const results: Array<{ id: string; name: string; status: string; error?: string }> = []
 
-    for (const service of services) {
+    for (const entry of autoStartEntries) {
+      const service = entry.service
       if (processManager.isRunning(service.id)) {
         results.push({ id: service.id, name: service.name, status: 'already_running' })
         continue
       }
 
       try {
+        const env: Record<string, string> = {}
+        if (service.port) env.PORT = String(service.port)
+        if (entry.cudaDevice) env.CUDA_DEVICE = entry.cudaDevice
+
         await processManager.startService(
           service.id,
           service.command,
-          buildEnv(service),
+          env,
           makeOnStateChange(service.id)
         )
         results.push({ id: service.id, name: service.name, status: 'started' })

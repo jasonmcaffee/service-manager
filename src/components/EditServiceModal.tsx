@@ -7,12 +7,25 @@ import { Service } from '@/types/service'
 interface EditServiceModalProps {
   service: Service | null
   isOpen: boolean
+  activeProfileId: string | null
   onClose: () => void
   onSave: (service: Service) => void
   onDelete: (id: string) => void
 }
 
-export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }: EditServiceModalProps) {
+function FieldBadge({ type }: { type: 'global' | 'profile' }) {
+  return (
+    <span className={`ml-1.5 text-[10px] font-medium px-1.5 py-0.5 rounded ${
+      type === 'global'
+        ? 'bg-zinc-700 text-zinc-400'
+        : 'bg-accent/20 text-accent'
+    }`}>
+      {type}
+    </span>
+  )
+}
+
+export function EditServiceModal({ service, isOpen, activeProfileId, onClose, onSave, onDelete }: EditServiceModalProps) {
   const [formData, setFormData] = useState({
     name: '',
     description: '',
@@ -42,21 +55,40 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
 
     setIsSaving(true)
     try {
-      const res = await fetch(`/api/services/${service.id}`, {
+      // Save global fields
+      const globalRes = await fetch(`/api/services/${service.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...formData,
+          name: formData.name,
+          description: formData.description,
+          command: formData.command,
           port: formData.port ? parseInt(formData.port) : null,
-          cudaDevice: formData.cudaDevice || null,
         }),
       })
-      
-      if (res.ok) {
-        const updated = await res.json()
-        onSave(updated)
-        onClose()
+
+      if (!globalRes.ok) return
+
+      const updated = await globalRes.json()
+
+      // Save profile-specific fields
+      if (activeProfileId) {
+        await fetch(`/api/profiles/${activeProfileId}/services/${service.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cudaDevice: formData.cudaDevice || null,
+            startOnBoot: formData.startOnBoot,
+          }),
+        })
       }
+
+      onSave({
+        ...updated,
+        cudaDevice: formData.cudaDevice || null,
+        startOnBoot: formData.startOnBoot,
+      })
+      onClose()
     } catch (error) {
       console.error('Failed to save service:', error)
     } finally {
@@ -67,11 +99,9 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
   const handleDelete = async () => {
     if (!service) return
     if (!confirm(`Are you sure you want to delete "${service.name}"?`)) return
-    
+
     try {
-      const res = await fetch(`/api/services/${service.id}`, {
-        method: 'DELETE',
-      })
+      const res = await fetch(`/api/services/${service.id}`, { method: 'DELETE' })
       if (res.ok) {
         onDelete(service.id)
         onClose()
@@ -85,19 +115,26 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Backdrop */}
-      <div 
-        className="absolute inset-0 bg-black/70 backdrop-blur-sm"
-        onClick={onClose}
-      />
-      
-      {/* Modal - full screen with small margin */}
+      <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={onClose} />
+
       <div className="absolute inset-4 card p-6 animate-slide-up overflow-y-auto">
-        <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center justify-between mb-4">
           <h2 className="text-xl font-semibold text-zinc-100">Edit Service</h2>
           <button onClick={onClose} className="btn-ghost p-2">
             <X size={20} />
           </button>
+        </div>
+
+        {/* Legend */}
+        <div className="flex items-center gap-3 mb-5 text-xs text-zinc-500">
+          <span className="flex items-center gap-1">
+            <span className="bg-zinc-700 text-zinc-400 px-1.5 py-0.5 rounded text-[10px] font-medium">global</span>
+            applies to all profiles
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="bg-accent/20 text-accent px-1.5 py-0.5 rounded text-[10px] font-medium">profile</span>
+            applies to current profile only
+          </span>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">
@@ -105,6 +142,7 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
             <div>
               <label className="block text-sm text-zinc-400 mb-1.5">
                 Service Name <span className="text-red-400">*</span>
+                <FieldBadge type="global" />
               </label>
               <input
                 type="text"
@@ -115,7 +153,10 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
               />
             </div>
             <div>
-              <label className="block text-sm text-zinc-400 mb-1.5">Description</label>
+              <label className="block text-sm text-zinc-400 mb-1.5">
+                Description
+                <FieldBadge type="global" />
+              </label>
               <input
                 type="text"
                 value={formData.description}
@@ -129,6 +170,7 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
           <div>
             <label className="block text-sm text-zinc-400 mb-1.5">
               Batch Script / Command <span className="text-red-400">*</span>
+              <FieldBadge type="global" />
             </label>
             <textarea
               value={formData.command}
@@ -141,7 +183,10 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm text-zinc-400 mb-1.5">Port</label>
+              <label className="block text-sm text-zinc-400 mb-1.5">
+                Port
+                <FieldBadge type="global" />
+              </label>
               <input
                 type="number"
                 value={formData.port}
@@ -153,7 +198,10 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
               />
             </div>
             <div>
-              <label className="block text-sm text-zinc-400 mb-1.5">CUDA Device</label>
+              <label className="block text-sm text-zinc-400 mb-1.5">
+                CUDA Device
+                <FieldBadge type="profile" />
+              </label>
               <input
                 type="text"
                 value={formData.cudaDevice}
@@ -172,7 +220,10 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
                 onChange={(e) => setFormData({ ...formData, startOnBoot: e.target.checked })}
                 className="w-4 h-4 rounded border-zinc-600 bg-zinc-700 text-accent focus:ring-accent/50"
               />
-              <span className="text-sm text-zinc-400">Start on boot</span>
+              <span className="text-sm text-zinc-400">
+                Start on boot
+                <FieldBadge type="profile" />
+              </span>
             </label>
           </div>
 
@@ -185,8 +236,8 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
               <button type="button" onClick={onClose} className="btn-ghost">
                 Cancel
               </button>
-              <button 
-                type="submit" 
+              <button
+                type="submit"
                 disabled={isSaving || !formData.name.trim() || !formData.command.trim()}
                 className="btn-primary"
               >

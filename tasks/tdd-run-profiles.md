@@ -34,17 +34,17 @@ Currently `cudaDevice` and `startOnBoot` live on the `Service` row. There is no 
 
 ```mermaid
 graph TD
-    UI[Main Screen] -->|dropdown select| ProfileAPI[/api/profiles]
+    UI["Main Screen"] -->|dropdown select| ProfileAPI["POST /api/profiles"]
     UI -->|+ clone| ProfileAPI
-    UI -->|switch profile| SwitchAPI[/api/profiles/active]
+    UI -->|switch profile| SwitchAPI["PUT /api/profiles/active"]
 
-    EditModal[Edit Service Modal] -->|save cudaDevice / startOnBoot| ServiceProfileAPI[/api/profiles/active/services/id]
-    EditModal -->|save command / port| GlobalServiceAPI[/api/services/id]
+    EditModal["Edit Service Modal"] -->|save cudaDevice, startOnBoot| ServiceProfileAPI["PUT /api/profiles/active/services/id"]
+    EditModal -->|save command, port| GlobalServiceAPI["PUT /api/services/id"]
 
     SwitchAPI -->|stop all| ProcessManager
     SwitchAPI -->|start autostart services| ProcessManager
 
-    ProfileAPI --> DB[(SQLite via Prisma)]
+    ProfileAPI --> DB[("SQLite via Prisma")]
     ServiceProfileAPI --> DB
     GlobalServiceAPI --> DB
 ```

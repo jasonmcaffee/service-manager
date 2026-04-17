@@ -4,18 +4,17 @@ export interface CreateServiceInput {
   name: string
   description?: string | null
   command: string
-  startOnBoot?: boolean
   port?: number | null
+  // cudaDevice and startOnBoot are profile-specific; stored in RunProfileService
   cudaDevice?: string | null
+  startOnBoot?: boolean
 }
 
 export interface UpdateServiceInput {
   name?: string
   description?: string | null
   command?: string
-  startOnBoot?: boolean
   port?: number | null
-  cudaDevice?: string | null
   status?: string
   pid?: number | null
 }
@@ -35,9 +34,7 @@ export const serviceRepository = {
         name: data.name,
         description: data.description ?? null,
         command: data.command,
-        startOnBoot: data.startOnBoot ?? false,
         port: data.port ?? null,
-        cudaDevice: data.cudaDevice ?? null,
         status: 'stopped',
         pid: null,
       },
@@ -52,10 +49,4 @@ export const serviceRepository = {
     await prisma.service.delete({ where: { id } })
   },
 
-  async findAutoStart() {
-    return prisma.service.findMany({
-      where: { startOnBoot: true },
-      orderBy: { createdAt: 'asc' },
-    })
-  },
 }

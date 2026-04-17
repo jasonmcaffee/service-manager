@@ -20,15 +20,13 @@ export async function PUT(
 ) {
   try {
     const body = await request.json()
-    const { name, description, command, startOnBoot, port, cudaDevice } = body
+    const { name, description, command, port } = body
 
     const service = await serviceService.updateService(params.id, {
       name,
       description,
       command,
-      startOnBoot,
       port: port ?? null,
-      cudaDevice: cudaDevice ?? null,
     })
 
     return NextResponse.json(service)

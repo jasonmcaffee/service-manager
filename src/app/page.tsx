@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { Service } from '@/types/service'
+import { Service, RunProfile } from '@/types/service'
 import { ServiceCard } from '@/components/ServiceCard'
 import { AddServiceModal } from '@/components/AddServiceModal'
 import { EditServiceModal } from '@/components/EditServiceModal'
@@ -10,6 +10,8 @@ import { Loader2, ServerOff } from 'lucide-react'
 
 export default function Home() {
   const [services, setServices] = useState<Service[]>([])
+  const [profiles, setProfiles] = useState<RunProfile[]>([])
+  const [activeProfile, setActiveProfile] = useState<RunProfile | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isAddModalOpen, setIsAddModalOpen] = useState(false)
   const [editingService, setEditingService] = useState<Service | null>(null)
@@ -32,7 +34,19 @@ export default function Home() {
     }
   }, [])
 
-  // Trigger auto-start services on initial page load
+  const fetchProfiles = useCallback(async () => {
+    try {
+      const res = await fetch('/api/profiles')
+      if (res.ok) {
+        const data: RunProfile[] = await res.json()
+        setProfiles(data)
+        setActiveProfile(data.find(p => p.isActive) ?? null)
+      }
+    } catch {
+      // profiles are non-critical for initial render
+    }
+  }, [])
+
   useEffect(() => {
     const triggerStartup = async () => {
       try {
@@ -42,14 +56,58 @@ export default function Home() {
       }
     }
     triggerStartup()
-  }, []) // Only run once on mount
+  }, [])
 
   useEffect(() => {
     fetchServices()
-    // Poll for updates every 2 seconds
+    fetchProfiles()
     const interval = setInterval(fetchServices, 2000)
     return () => clearInterval(interval)
-  }, [fetchServices])
+  }, [fetchServices, fetchProfiles])
+
+  const handleSwitchProfile = async (profileId: string) => {
+    try {
+      const res = await fetch('/api/profiles/active', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profileId }),
+      })
+      if (res.ok) {
+        await fetchProfiles()
+        await fetchServices()
+      }
+    } catch (error) {
+      console.error('Failed to switch profile:', error)
+    }
+  }
+
+  const handleRenameProfile = async (profileId: string, name: string) => {
+    try {
+      const res = await fetch(`/api/profiles/${profileId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      if (res.ok) await fetchProfiles()
+    } catch (error) {
+      console.error('Failed to rename profile:', error)
+    }
+  }
+
+  const handleCreateProfile = async () => {
+    const name = prompt('New profile name:')
+    if (!name?.trim()) return
+    try {
+      const res = await fetch('/api/profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim() }),
+      })
+      if (res.ok) await fetchProfiles()
+    } catch (error) {
+      console.error('Failed to create profile:', error)
+    }
+  }
 
   const handleAddService = (service: Service) => {
     setServices([...services, service])
@@ -57,6 +115,8 @@ export default function Home() {
 
   const handleUpdateService = (updated: Service) => {
     setServices(services.map(s => s.id === updated.id ? { ...s, ...updated } : s))
+    // Refresh services to get latest profile-merged values
+    fetchServices()
   }
 
   const handleDeleteService = (id: string) => {
@@ -71,6 +131,11 @@ export default function Home() {
         onAddService={() => setIsAddModalOpen(true)}
         runningCount={runningCount}
         totalCount={services.length}
+        profiles={profiles}
+        activeProfile={activeProfile}
+        onSwitchProfile={handleSwitchProfile}
+        onCreateProfile={handleCreateProfile}
+        onRenameProfile={handleRenameProfile}
       />
 
       <main className="w-full px-4 py-4">
@@ -101,8 +166,8 @@ export default function Home() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {services.map((service, index) => (
-              <div 
-                key={service.id} 
+              <div
+                key={service.id}
                 style={{ animationDelay: `${index * 50}ms` }}
                 className="animate-fade-in"
               >
@@ -127,6 +192,7 @@ export default function Home() {
       <EditServiceModal
         service={editingService}
         isOpen={editingService !== null}
+        activeProfileId={activeProfile?.id ?? null}
         onClose={() => setEditingService(null)}
         onSave={handleUpdateService}
         onDelete={handleDeleteService}
