@@ -18,6 +18,8 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
     description: '',
     command: '',
     startOnBoot: false,
+    port: '',
+    cudaDevice: '',
   })
   const [isSaving, setIsSaving] = useState(false)
 
@@ -28,6 +30,8 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
         description: service.description || '',
         command: service.command,
         startOnBoot: service.startOnBoot,
+        port: service.port ? String(service.port) : '',
+        cudaDevice: service.cudaDevice || '',
       })
     }
   }, [service])
@@ -41,7 +45,11 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
       const res = await fetch(`/api/services/${service.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({
+          ...formData,
+          port: formData.port ? parseInt(formData.port) : null,
+          cudaDevice: formData.cudaDevice || null,
+        }),
       })
       
       if (res.ok) {
@@ -129,6 +137,31 @@ export function EditServiceModal({ service, isOpen, onClose, onSave, onDelete }:
               placeholder="echo Hello World"
               required
             />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm text-zinc-400 mb-1.5">Port</label>
+              <input
+                type="number"
+                value={formData.port}
+                onChange={(e) => setFormData({ ...formData, port: e.target.value })}
+                className="input-field w-full"
+                placeholder="8080"
+                min={1}
+                max={65535}
+              />
+            </div>
+            <div>
+              <label className="block text-sm text-zinc-400 mb-1.5">CUDA Device</label>
+              <input
+                type="text"
+                value={formData.cudaDevice}
+                onChange={(e) => setFormData({ ...formData, cudaDevice: e.target.value })}
+                className="input-field w-full"
+                placeholder="0"
+              />
+            </div>
           </div>
 
           <div className="flex items-center">

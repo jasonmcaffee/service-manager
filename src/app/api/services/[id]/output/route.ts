@@ -1,15 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { processManager } from '@/lib/process-manager'
+import { serviceService } from '@/lib/services/serviceService'
 
-// GET service output
 export async function GET(
   request: NextRequest,
   { params }: { params: { id: string } }
 ) {
   try {
-    const output = processManager.getOutput(params.id)
-    const status = processManager.getStatus(params.id)
-    
+    const output = serviceService.getOutput(params.id)
+    const status = serviceService.getProcessStatus(params.id)
     return NextResponse.json({
       output,
       status: status?.status || 'stopped',
@@ -20,13 +18,12 @@ export async function GET(
   }
 }
 
-// DELETE clear output
 export async function DELETE(
   request: NextRequest,
   { params }: { params: { id: string } }
 ) {
   try {
-    processManager.clearOutput(params.id)
+    serviceService.clearOutput(params.id)
     return NextResponse.json({ success: true })
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 })

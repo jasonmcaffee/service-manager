@@ -15,6 +15,8 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
     description: '',
     command: '',
     startOnBoot: false,
+    port: '',
+    cudaDevice: '',
   })
   const [isSubmitting, setIsSubmitting] = useState(false)
 
@@ -27,7 +29,11 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
       const res = await fetch('/api/services', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({
+          ...formData,
+          port: formData.port ? parseInt(formData.port) : null,
+          cudaDevice: formData.cudaDevice || null,
+        }),
       })
       
       if (res.ok) {
@@ -38,6 +44,8 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
           description: '',
           command: '',
           startOnBoot: false,
+          port: '',
+          cudaDevice: '',
         })
         onClose()
       }
@@ -105,6 +113,31 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
               placeholder="echo Hello World&#10;cd /d C:\myapp&#10;npm start"
               required
             />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm text-zinc-400 mb-1.5">Port</label>
+              <input
+                type="number"
+                value={formData.port}
+                onChange={(e) => setFormData({ ...formData, port: e.target.value })}
+                className="input-field w-full"
+                placeholder="8080"
+                min={1}
+                max={65535}
+              />
+            </div>
+            <div>
+              <label className="block text-sm text-zinc-400 mb-1.5">CUDA Device</label>
+              <input
+                type="text"
+                value={formData.cudaDevice}
+                onChange={(e) => setFormData({ ...formData, cudaDevice: e.target.value })}
+                className="input-field w-full"
+                placeholder="0"
+              />
+            </div>
           </div>
 
           <div className="flex items-center">

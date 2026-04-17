@@ -1,68 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { exec } from 'child_process'
-import { promisify } from 'util'
-
-const execAsync = promisify(exec)
+import { killPort, isPortListening } from '@/lib/util/portHelper'
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { port } = body
+    const { port } = await request.json()
 
-    if (!port || isNaN(port)) {
+    if (!port || isNaN(port) || port < 1 || port > 65535) {
       return NextResponse.json({ message: 'Invalid port number' }, { status: 400 })
     }
 
-    // Find process using the port
-    const { stdout: netstatOutput } = await execAsync(
-      `netstat -ano | findstr ":${port}" | findstr "LISTENING"`
-    ).catch(() => ({ stdout: '' }))
-
-    if (!netstatOutput.trim()) {
+    const listening = await isPortListening(port)
+    if (!listening) {
       return NextResponse.json({ message: `No process found on port ${port}` }, { status: 404 })
     }
 
-    // Extract PIDs from netstat output
-    const lines = netstatOutput.trim().split('\n')
-    const pids = new Set<string>()
-    
-    for (const line of lines) {
-      const parts = line.trim().split(/\s+/)
-      const pid = parts[parts.length - 1]
-      if (pid && !isNaN(parseInt(pid))) {
-        pids.add(pid)
-      }
-    }
+    const { killed, pids } = await killPort(port)
 
-    const pidArray = Array.from(pids)
-    
-    if (pidArray.length === 0) {
-      return NextResponse.json({ message: `No process found on port ${port}` }, { status: 404 })
-    }
-
-    // Kill each process
-    const killedPids: string[] = []
-    const errors: string[] = []
-
-    for (const pid of pidArray) {
-      try {
-        await execAsync(`taskkill /PID ${pid} /T /F`)
-        killedPids.push(pid)
-      } catch (error: any) {
-        // Check if it's just "process not found" which is fine
-        if (!error.message?.includes('not found')) {
-          errors.push(`PID ${pid}: ${error.message}`)
-        }
-      }
-    }
-
-    if (killedPids.length > 0) {
+    if (killed) {
       return NextResponse.json({
-        message: `Killed PID${killedPids.length > 1 ? 's' : ''}: ${killedPids.join(', ')}`,
-        pids: killedPids,
+        message: `Killed PID${pids.length > 1 ? 's' : ''}: ${pids.join(', ')}`,
+        pids,
       })
-    } else if (errors.length > 0) {
-      return NextResponse.json({ message: errors.join('; ') }, { status: 500 })
     } else {
       return NextResponse.json({ message: `No process found on port ${port}` }, { status: 404 })
     }

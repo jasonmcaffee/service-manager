@@ -1,8 +1,6 @@
 import { ChildProcess, spawn } from 'child_process'
 import { EventEmitter } from 'events'
-import path from 'path'
-import fs from 'fs'
-import os from 'os'
+import { writeBatchFile } from '@/lib/util/batchWriter'
 
 const treeKill = require('tree-kill')
 
@@ -26,12 +24,21 @@ const globalForProcessManager = globalThis as unknown as {
 class ProcessManager extends EventEmitter {
   private processes: Map<string, ServiceProcess> = new Map()
   private maxOutputLines = 1000
+  private bootStarted = false
 
   static getInstance(): ProcessManager {
     if (!globalForProcessManager.processManagerInstance) {
       globalForProcessManager.processManagerInstance = new ProcessManager()
     }
     return globalForProcessManager.processManagerInstance
+  }
+
+  hasBootStarted(): boolean {
+    return this.bootStarted
+  }
+
+  markBootStarted(): void {
+    this.bootStarted = true
   }
 
   getStatus(serviceId: string): ServiceProcess | undefined {
@@ -85,6 +92,7 @@ class ProcessManager extends EventEmitter {
   async startService(
     serviceId: string,
     command: string,
+    env: Record<string, string> = {},
     onStateChange?: (status: ServiceStatus, pid?: number) => Promise<void>
   ): Promise<void> {
     // Kill existing process if running
@@ -93,14 +101,7 @@ class ProcessManager extends EventEmitter {
       await this.stopService(serviceId, onStateChange)
     }
 
-    // Create temp batch file for the command
-    const tempDir = path.join(os.tmpdir(), 'service-manager')
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true })
-    }
-
-    const batFile = path.join(tempDir, `service-${serviceId}.bat`)
-    fs.writeFileSync(batFile, command, 'utf-8')
+    const batFile = writeBatchFile(serviceId, command, env)
 
     const serviceProcess: ServiceProcess = {
       id: serviceId,
@@ -265,12 +266,12 @@ class ProcessManager extends EventEmitter {
   async restartService(
     serviceId: string,
     command: string,
+    env: Record<string, string> = {},
     onStateChange?: (status: ServiceStatus, pid?: number) => Promise<void>
   ): Promise<void> {
     await this.stopService(serviceId, onStateChange)
-    // Small delay before restart
     await new Promise(resolve => setTimeout(resolve, 500))
-    await this.startService(serviceId, command, onStateChange)
+    await this.startService(serviceId, command, env, onStateChange)
   }
 
   getOutput(serviceId: string): string[] {

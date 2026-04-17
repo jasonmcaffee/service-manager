@@ -6,6 +6,8 @@ export interface Service {
   description: string | null
   command: string
   startOnBoot: boolean
+  port: number | null
+  cudaDevice: string | null
   pid: number | null
   status: ServiceStatus
   createdAt: string
