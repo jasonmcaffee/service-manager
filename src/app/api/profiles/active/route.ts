@@ -17,9 +17,9 @@ export async function PUT(request: NextRequest) {
     if (!profileId) {
       return NextResponse.json({ error: 'profileId is required' }, { status: 400 })
     }
-    const result = await runProfileService.switchProfile(profileId)
-    return NextResponse.json(result)
+    const { profile } = await runProfileService.switchProfile(profileId)
+    return NextResponse.json(profile)
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: error.message }, { status: error.statusCode ?? 500 })
   }
 }

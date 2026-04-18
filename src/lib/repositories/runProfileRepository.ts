@@ -5,32 +5,42 @@ export interface UpsertProfileServiceInput {
   startOnBoot?: boolean
 }
 
+const profileInclude = {
+  services: {
+    include: {
+      service: {
+        select: { name: true, port: true },
+      },
+    },
+  },
+} as const
+
 export const runProfileRepository = {
   async findAll() {
     return prisma.runProfile.findMany({
       orderBy: { createdAt: 'asc' },
-      include: { services: true },
+      include: profileInclude,
     })
   },
 
   async findById(id: string) {
     return prisma.runProfile.findUnique({
       where: { id },
-      include: { services: true },
+      include: profileInclude,
     })
   },
 
   async findActive() {
     return prisma.runProfile.findFirst({
       where: { isActive: true },
-      include: { services: true },
+      include: profileInclude,
     })
   },
 
   async create(name: string) {
     return prisma.runProfile.create({
       data: { name, isActive: false },
-      include: { services: true },
+      include: profileInclude,
     })
   },
 
@@ -39,7 +49,7 @@ export const runProfileRepository = {
     return prisma.runProfile.update({
       where: { id },
       data: { isActive: true },
-      include: { services: true },
+      include: profileInclude,
     })
   },
 
@@ -47,7 +57,7 @@ export const runProfileRepository = {
     return prisma.runProfile.update({
       where: { id },
       data: { name },
-      include: { services: true },
+      include: profileInclude,
     })
   },
 

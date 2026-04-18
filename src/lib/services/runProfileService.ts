@@ -58,6 +58,13 @@ export const runProfileService = {
   },
 
   async switchProfile(id: string) {
+    const exists = await runProfileRepository.findById(id)
+    if (!exists) {
+      const err = new Error(`Profile not found: ${id}`)
+      ;(err as any).statusCode = 404
+      throw err
+    }
+
     // Stop all running services
     const allServices = await serviceRepository.findAll()
     for (const service of allServices) {

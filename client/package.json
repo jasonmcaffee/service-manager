@@ -1,0 +1,17 @@
+{
+  "name": "service-manager-client",
+  "version": "1.0.0",
+  "description": "TypeScript client for the service-manager API",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "node ../node_modules/typescript/bin/tsc",
+    "prepare": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
