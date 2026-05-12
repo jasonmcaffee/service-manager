@@ -13,6 +13,8 @@ model Service {
   description   String?
   command       String
   port          Int?
+  noPort        Boolean              @default(false)
+  wsl           Boolean              @default(false)
   cudaDevice    String?
   startOnBoot   Boolean              @default(false)
 

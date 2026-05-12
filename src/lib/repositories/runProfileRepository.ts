@@ -86,14 +86,13 @@ export const runProfileRepository = {
   async createProfileServicesForAllProfiles(serviceId: string, activeProfileOverride?: UpsertProfileServiceInput) {
     const profiles = await prisma.runProfile.findMany()
     for (const profile of profiles) {
-      const isActive = profile.isActive
       await prisma.runProfileService.upsert({
         where: { profileId_serviceId: { profileId: profile.id, serviceId } },
         create: {
           profileId: profile.id,
           serviceId,
-          cudaDevice: isActive ? (activeProfileOverride?.cudaDevice ?? null) : null,
-          startOnBoot: isActive ? (activeProfileOverride?.startOnBoot ?? false) : false,
+          cudaDevice: activeProfileOverride?.cudaDevice ?? null,
+          startOnBoot: activeProfileOverride?.startOnBoot ?? false,
         },
         update: {},
       })

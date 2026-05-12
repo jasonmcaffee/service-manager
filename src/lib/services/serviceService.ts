@@ -1,25 +1,22 @@
+import fs from 'fs'
 import { processManager, ServiceStatus } from '@/lib/process-manager'
 import { serviceRepository, CreateServiceInput, UpdateServiceInput } from '@/lib/repositories/serviceRepository'
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
-import { ensureDefaultProfile } from '@/lib/services/runProfileService'
-import { killPort } from '@/lib/util/portHelper'
+import { initializeIfNeeded } from '@/lib/services/init'
+import { killPort, getWslPidsOnPort, killWslPids } from '@/lib/util/portHelper'
+import { getLogFilePath } from '@/lib/util/logTailer'
 
-const globalForInit = globalThis as unknown as { processManagerInitialized: boolean }
-
-async function initializeIfNeeded() {
-  if (globalForInit.processManagerInitialized) return
-  globalForInit.processManagerInitialized = true
-
-  await ensureDefaultProfile()
-
-  const services = await serviceRepository.findAll()
-  for (const service of services) {
-    if (service.pid && service.status === 'running') {
-      processManager.restoreFromDb(service.id, service.pid, 'running')
-      if (!processManager.isRunning(service.id)) {
-        await serviceRepository.update(service.id, { status: 'stopped', pid: null })
-      }
-    }
+/**
+ * Reads the log file for a service and returns its lines, or empty array if unavailable.
+ * @param id - service identifier used to locate the log file
+ */
+function readLogFileLines(id: string): string[] {
+  try {
+    const logFile = getLogFilePath(id)
+    if (!fs.existsSync(logFile)) return []
+    return fs.readFileSync(logFile, 'utf-8').split('\n')
+  } catch {
+    return []
   }
 }
 
@@ -40,11 +37,43 @@ async function buildEnvForService(serviceId: string, port: number | null | undef
   return env
 }
 
+/**
+ * Kills any WSL processes still listening on the given port.
+ * Required for WSL services: treeKill only reaches the Windows-side wsl.exe wrapper;
+ * the actual Linux process inside the VM survives and keeps holding the port,
+ * causing EADDRINUSE on the next start attempt.
+ * @param port - WSL port to clear of lingering processes
+ */
+async function killOrphanedWslProcesses(port: number): Promise<void> {
+  const pids = await getWslPidsOnPort(port)
+  if (pids.length > 0) {
+    console.log(`[serviceService] killing ${pids.length} orphaned WSL process(es) on port ${port}: ${pids.join(', ')}`)
+    await killWslPids(pids)
+  }
+}
+
 function validatePort(port: number | null | undefined) {
   if (port === undefined || port === null) return
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     const err = new Error('Port must be an integer between 1 and 65535')
     ;(err as any).statusCode = 400
+    throw err
+  }
+}
+
+/**
+ * Warns (409) if another service already uses the given port.
+ * @param port - the port to check
+ * @param excludeId - service id to exclude from the check (for updates)
+ */
+async function checkPortUniqueness(port: number | null | undefined, excludeId?: string): Promise<void> {
+  if (!port) return
+  const existing = await serviceRepository.findByPort(port)
+  const conflicts = excludeId ? existing.filter(s => s.id !== excludeId) : existing
+  if (conflicts.length > 0) {
+    const names = conflicts.map(s => s.name).join(', ')
+    const err = new Error(`Port ${port} is already used by: ${names}. Two services on the same port will cause adoption conflicts.`)
+    ;(err as any).statusCode = 409
     throw err
   }
 }
@@ -68,7 +97,7 @@ export const serviceService = {
     return Promise.all(services.map(async (service) => {
       let { status, pid } = service
 
-      if (status === 'running' && pid) {
+      if (status === 'running') {
         if (!processManager.isRunning(service.id)) {
           status = 'stopped'
           pid = null
@@ -97,15 +126,15 @@ export const serviceService = {
       ...merged,
       status: mem?.status ?? service.status,
       pid: mem?.pid ?? service.pid ?? null,
-      output: mem?.output || [],
+      output: mem ? processManager.getOutput(id) : readLogFileLines(id),
     }
   },
 
   async createService(input: CreateServiceInput) {
     validatePort(input.port)
+    await checkPortUniqueness(input.port)
     const service = await serviceRepository.create(input)
 
-    // Create RunProfileService rows for all existing profiles
     const active = await runProfileRepository.findActive()
     await runProfileRepository.createProfileServicesForAllProfiles(service.id, {
       cudaDevice: input.cudaDevice ?? null,
@@ -128,6 +157,7 @@ export const serviceService = {
     }
 
     validatePort(input.port)
+    await checkPortUniqueness(input.port, id)
 
     const mem = processManager.getStatus(id)
     const currentStatus = mem?.status || current.status
@@ -151,11 +181,16 @@ export const serviceService = {
   },
 
   async startService(id: string) {
+    await initializeIfNeeded()
     const service = await serviceRepository.findById(id)
     if (!service) {
       const err = new Error('Service not found')
       ;(err as any).statusCode = 404
       throw err
+    }
+
+    if ((service as any).wsl && service.port) {
+      await killOrphanedWslProcesses(service.port)
     }
 
     const env = await buildEnvForService(id, service.port)
@@ -186,6 +221,10 @@ export const serviceService = {
       await onStateChange('stopped', undefined)
     }
 
+    if ((service as any).wsl && service.port) {
+      await killOrphanedWslProcesses(service.port)
+    }
+
     const mem = processManager.getStatus(id)
     return {
       id,
@@ -195,11 +234,16 @@ export const serviceService = {
   },
 
   async restartService(id: string) {
+    await initializeIfNeeded()
     const service = await serviceRepository.findById(id)
     if (!service) {
       const err = new Error('Service not found')
       ;(err as any).statusCode = 404
       throw err
+    }
+
+    if ((service as any).wsl && service.port) {
+      await killOrphanedWslProcesses(service.port)
     }
 
     const env = await buildEnvForService(id, service.port)
@@ -215,12 +259,13 @@ export const serviceService = {
   },
 
   async runAutoStart() {
+    await initializeIfNeeded()
+
     if (processManager.hasBootStarted()) {
       return { alreadyStarted: true, results: [] }
     }
     processManager.markBootStarted()
 
-    await ensureDefaultProfile()
     const active = await runProfileRepository.findActive()
     if (!active) return { alreadyStarted: false, results: [] }
 
@@ -238,6 +283,10 @@ export const serviceService = {
         const env: Record<string, string> = {}
         if (service.port) env.PORT = String(service.port)
         if (entry.cudaDevice) env.CUDA_DEVICE = entry.cudaDevice
+
+        if ((service as any).wsl && service.port) {
+          await killOrphanedWslProcesses(service.port)
+        }
 
         await processManager.startService(
           service.id,

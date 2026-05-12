@@ -3,6 +3,8 @@ const mockProcessManager = {
   isRunning: jest.fn(() => false),
   startService: jest.fn(async () => {}),
   stopService: jest.fn(async () => {}),
+  restartService: jest.fn(async () => {}),
+  adoptExternal: jest.fn(),
 }
 
 jest.mock('@/lib/process-manager', () => ({
@@ -35,14 +37,21 @@ const mockProfileRepo = {
   cloneProfileServices: jest.fn(async () => {}),
   findAutoStartServices: jest.fn(async () => []),
   count: jest.fn(async () => 1),
+  rename: jest.fn(async (id: string, name: string) => ({ id, name, isActive: false, services: [] })),
 }
 
 jest.mock('@/lib/repositories/runProfileRepository', () => ({
   runProfileRepository: mockProfileRepo,
 }))
 
+// Mock init so initializeIfNeeded is a no-op in these tests
+jest.mock('@/lib/services/init', () => ({
+  initializeIfNeeded: jest.fn(async () => {}),
+  ensureDefaultProfile: jest.fn(async () => {}),
+}))
+
 jest.mock('@/lib/util/batchWriter', () => ({
-  writeBatchFile: jest.fn(() => '/tmp/test.bat'),
+  writeStartupScript: jest.fn(() => ({ scriptFile: '/tmp/test.bat', logFile: '/tmp/test.log' })),
 }))
 
 beforeEach(() => {
@@ -118,73 +127,93 @@ describe('runProfileService.createProfile', () => {
   })
 })
 
-describe('runProfileService.switchProfile', () => {
-  it('stops all running services', async () => {
-    const svc1 = makeService({ id: 'svc-1' })
-    const svc2 = makeService({ id: 'svc-2' })
-    mockServiceRepo.findAll.mockResolvedValue([svc1, svc2])
+describe('runProfileService.switchProfile — diff behaviour', () => {
+  const prevProfile = makeProfile({ id: 'profile-1', services: [{ serviceId: 'svc-1', cudaDevice: '0', startOnBoot: true }] })
+  const targetProfile = makeProfile({ id: 'profile-2', services: [{ serviceId: 'svc-1', cudaDevice: '0', startOnBoot: true }] })
+  const svc1 = makeService({ id: 'svc-1', command: 'echo hello', port: null })
+
+  it('does NOT stop a service whose config is identical between profiles', async () => {
+    mockProfileRepo.findById
+      .mockResolvedValueOnce(targetProfile)  // exists check
+      .mockResolvedValueOnce(prevProfile)    // buildEffectiveConfigs prev
+      .mockResolvedValueOnce(targetProfile)  // buildEffectiveConfigs next
+    mockProfileRepo.findActive.mockResolvedValue(prevProfile)
+    mockServiceRepo.findAll.mockResolvedValue([svc1])
     mockProcessManager.isRunning.mockReturnValue(true)
-    mockProfileRepo.setActive.mockResolvedValue(makeProfile({ id: 'profile-2', isActive: true }))
+    mockProfileRepo.setActive.mockResolvedValue(targetProfile)
 
     await runProfileService.switchProfile('profile-2')
 
-    expect(mockProcessManager.stopService).toHaveBeenCalledTimes(2)
+    expect(mockProcessManager.stopService).not.toHaveBeenCalled()
+    expect(mockProcessManager.restartService).not.toHaveBeenCalled()
   })
 
-  it('does not stop services that are not running', async () => {
-    mockServiceRepo.findAll.mockResolvedValue([makeService()])
+  it('restarts a service when cudaDevice changes and it is running', async () => {
+    const prevWithCuda = makeProfile({ id: 'profile-1', services: [{ serviceId: 'svc-1', cudaDevice: '0', startOnBoot: true }] })
+    const nextWithCuda = makeProfile({ id: 'profile-2', services: [{ serviceId: 'svc-1', cudaDevice: '1', startOnBoot: true }] })
+
+    mockProfileRepo.findById
+      .mockResolvedValueOnce(nextWithCuda) // exists check
+      .mockResolvedValueOnce(prevWithCuda) // prev configs
+      .mockResolvedValueOnce(nextWithCuda) // next configs
+    mockProfileRepo.findActive.mockResolvedValue(prevWithCuda)
+    mockServiceRepo.findAll.mockResolvedValue([svc1])
+    mockServiceRepo.findById.mockResolvedValue(svc1)
+    mockProcessManager.isRunning.mockReturnValue(true)
+    mockProfileRepo.setActive.mockResolvedValue(nextWithCuda)
+
+    await runProfileService.switchProfile('profile-2')
+
+    expect(mockProcessManager.restartService).toHaveBeenCalledWith(
+      'svc-1', 'echo hello', { CUDA_DEVICE: '1' }, expect.any(Function)
+    )
+  })
+
+  it('stops a running service that is not startOnBoot in the target profile', async () => {
+    const prevAutoStart = makeProfile({ id: 'profile-1', services: [{ serviceId: 'svc-1', cudaDevice: null, startOnBoot: true }] })
+    const nextNoStart = makeProfile({ id: 'profile-2', services: [{ serviceId: 'svc-1', cudaDevice: null, startOnBoot: false }] })
+
+    mockProfileRepo.findById
+      .mockResolvedValueOnce(nextNoStart)
+      .mockResolvedValueOnce(prevAutoStart)
+      .mockResolvedValueOnce(nextNoStart)
+    mockProfileRepo.findActive.mockResolvedValue(prevAutoStart)
+    mockServiceRepo.findAll.mockResolvedValue([svc1])
+    mockServiceRepo.findById.mockResolvedValue(svc1)
+    mockProcessManager.isRunning.mockReturnValue(true)
+    mockProfileRepo.setActive.mockResolvedValue(nextNoStart)
+
+    await runProfileService.switchProfile('profile-2')
+
+    expect(mockProcessManager.stopService).toHaveBeenCalledWith('svc-1', expect.any(Function))
+    expect(mockProcessManager.startService).not.toHaveBeenCalled()
+  })
+
+  it('starts a service that becomes startOnBoot and is not currently running', async () => {
+    const prevNoStart = makeProfile({ id: 'profile-1', services: [{ serviceId: 'svc-1', cudaDevice: null, startOnBoot: false }] })
+    const nextAutoStart = makeProfile({ id: 'profile-2', services: [{ serviceId: 'svc-1', cudaDevice: null, startOnBoot: true }] })
+
+    mockProfileRepo.findById
+      .mockResolvedValueOnce(nextAutoStart)
+      .mockResolvedValueOnce(prevNoStart)
+      .mockResolvedValueOnce(nextAutoStart)
+    mockProfileRepo.findActive.mockResolvedValue(prevNoStart)
+    mockServiceRepo.findAll.mockResolvedValue([svc1])
+    mockServiceRepo.findById.mockResolvedValue(svc1)
     mockProcessManager.isRunning.mockReturnValue(false)
-    mockProfileRepo.setActive.mockResolvedValue(makeProfile())
+    mockProfileRepo.setActive.mockResolvedValue(nextAutoStart)
 
-    await runProfileService.switchProfile('profile-1')
+    await runProfileService.switchProfile('profile-2')
 
+    expect(mockProcessManager.startService).toHaveBeenCalledWith(
+      'svc-1', 'echo hello', {}, expect.any(Function)
+    )
     expect(mockProcessManager.stopService).not.toHaveBeenCalled()
   })
 
-  it('sets the new profile as active', async () => {
-    mockServiceRepo.findAll.mockResolvedValue([])
-    mockProfileRepo.setActive.mockResolvedValue(makeProfile({ id: 'profile-2', isActive: true }))
-
-    await runProfileService.switchProfile('profile-2')
-
-    expect(mockProfileRepo.setActive).toHaveBeenCalledWith('profile-2')
-  })
-
-  it('starts autostart services for the new profile', async () => {
-    const svc = makeService()
-    mockServiceRepo.findAll.mockResolvedValue([])
-    mockProfileRepo.setActive.mockResolvedValue(makeProfile({ id: 'profile-2' }))
-    mockProfileRepo.findAutoStartServices.mockResolvedValue([
-      { service: svc, cudaDevice: '1', startOnBoot: true }
-    ])
-
-    const result = await runProfileService.switchProfile('profile-2')
-
-    expect(mockProcessManager.startService).toHaveBeenCalledWith(
-      'svc-1',
-      'echo hello',
-      { CUDA_DEVICE: '1' },
-      expect.any(Function)
-    )
-    expect(result.startedServices[0].status).toBe('started')
-  })
-
-  it('passes PORT env var when service has a port', async () => {
-    const svc = makeService({ port: 8080 })
-    mockServiceRepo.findAll.mockResolvedValue([])
-    mockProfileRepo.setActive.mockResolvedValue(makeProfile({ id: 'profile-2' }))
-    mockProfileRepo.findAutoStartServices.mockResolvedValue([
-      { service: svc, cudaDevice: null, startOnBoot: true }
-    ])
-
-    await runProfileService.switchProfile('profile-2')
-
-    expect(mockProcessManager.startService).toHaveBeenCalledWith(
-      'svc-1',
-      'echo hello',
-      { PORT: '8080' },
-      expect.any(Function)
-    )
+  it('throws 404 when switching to a non-existent profile', async () => {
+    mockProfileRepo.findById.mockResolvedValueOnce(null)
+    await expect(runProfileService.switchProfile('bad-id')).rejects.toThrow('Profile not found')
   })
 })
 

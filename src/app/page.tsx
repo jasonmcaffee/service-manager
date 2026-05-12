@@ -1,12 +1,83 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, memo } from 'react'
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from '@dnd-kit/core'
+import {
+  SortableContext,
+  useSortable,
+  rectSortingStrategy,
+  arrayMove,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import { Service, RunProfile } from '@/types/service'
 import { ServiceCard } from '@/components/ServiceCard'
 import { AddServiceModal } from '@/components/AddServiceModal'
 import { EditServiceModal } from '@/components/EditServiceModal'
 import { Header } from '@/components/Header'
+import { useServiceOrder } from '@/hooks/useServiceOrder'
+import { useCollapsedServices } from '@/hooks/useCollapsedServices'
 import { Loader2, ServerOff } from 'lucide-react'
+
+interface SortableServiceCardProps {
+  service: Service
+  isCollapsed: boolean
+  onToggleCollapse: () => void
+  onUpdate: (service: Service) => void
+  onPatch: (patch: Partial<Service> & { id: string }) => void
+  onEditClick: (service: Service) => void
+}
+
+/** Wraps ServiceCard with dnd-kit sortable behaviour. Memoized to prevent sibling re-renders. */
+const SortableServiceCard = memo(function SortableServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, onPatch, onEditClick }: SortableServiceCardProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: service.id })
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+  }
+
+  return (
+    <div ref={setNodeRef} style={style}>
+      <ServiceCard
+        service={service}
+        isCollapsed={isCollapsed}
+        onToggleCollapse={onToggleCollapse}
+        onUpdate={onUpdate}
+        onPatch={onPatch}
+        onEditClick={onEditClick}
+        dragHandleProps={{ ...attributes, ...listeners }}
+      />
+    </div>
+  )
+}, (prev, next) => {
+  // Only re-render when this card's own data or UI state changes
+  return (
+    prev.service.id === next.service.id &&
+    prev.service.status === next.service.status &&
+    prev.service.pid === next.service.pid &&
+    prev.service.port === next.service.port &&
+    prev.service.noPort === next.service.noPort &&
+    prev.service.wsl === next.service.wsl &&
+    prev.service.name === next.service.name &&
+    prev.service.description === next.service.description &&
+    prev.service.command === next.service.command &&
+    prev.service.cudaDevice === next.service.cudaDevice &&
+    prev.service.startOnBoot === next.service.startOnBoot &&
+    prev.isCollapsed === next.isCollapsed &&
+    prev.onToggleCollapse === next.onToggleCollapse &&
+    prev.onUpdate === next.onUpdate &&
+    prev.onPatch === next.onPatch &&
+    prev.onEditClick === next.onEditClick
+  )
+})
 
 export default function Home() {
   const [services, setServices] = useState<Service[]>([])
@@ -16,6 +87,13 @@ export default function Home() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false)
   const [editingService, setEditingService] = useState<Service | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const { orderedServices, setOrder } = useServiceOrder(services)
+  const { isCollapsed, toggle: toggleCollapse } = useCollapsedServices()
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  )
 
   const fetchServices = useCallback(async () => {
     try {
@@ -64,6 +142,15 @@ export default function Home() {
     const interval = setInterval(fetchServices, 2000)
     return () => clearInterval(interval)
   }, [fetchServices, fetchProfiles])
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+    const oldIndex = orderedServices.findIndex(s => s.id === active.id)
+    const newIndex = orderedServices.findIndex(s => s.id === over.id)
+    const reordered = arrayMove(orderedServices, oldIndex, newIndex)
+    setOrder(reordered.map(s => s.id))
+  }
 
   const handleSwitchProfile = async (profileId: string) => {
     try {
@@ -115,9 +202,13 @@ export default function Home() {
 
   const handleUpdateService = (updated: Service) => {
     setServices(services.map(s => s.id === updated.id ? { ...s, ...updated } : s))
-    // Refresh services to get latest profile-merged values
     fetchServices()
   }
+
+  /** Applies a partial patch to a single card without refetching all services. */
+  const applyServicePatch = useCallback((patch: Partial<Service> & { id: string }) => {
+    setServices(prev => prev.map(s => s.id === patch.id ? { ...s, ...patch } : s))
+  }, [])
 
   const handleDeleteService = (id: string) => {
     setServices(services.filter(s => s.id !== id))
@@ -164,22 +255,30 @@ export default function Home() {
             </button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {services.map((service, index) => (
-              <div
-                key={service.id}
-                style={{ animationDelay: `${index * 50}ms` }}
-                className="animate-fade-in"
-              >
-                <ServiceCard
-                  service={service}
-                  onUpdate={handleUpdateService}
-                  onRefresh={fetchServices}
-                  onEditClick={setEditingService}
-                />
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={orderedServices.map(s => s.id)}
+              strategy={rectSortingStrategy}
+            >
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                {orderedServices.map(service => (
+                  <SortableServiceCard
+                    key={service.id}
+                    service={service}
+                    isCollapsed={isCollapsed(service.id)}
+                    onToggleCollapse={() => toggleCollapse(service.id)}
+                    onUpdate={handleUpdateService}
+                    onPatch={applyServicePatch}
+                    onEditClick={setEditingService}
+                  />
+                ))}
               </div>
-            ))}
-          </div>
+            </SortableContext>
+          </DndContext>
         )}
       </main>
 

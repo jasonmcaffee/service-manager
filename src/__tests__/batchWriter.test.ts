@@ -1,49 +1,89 @@
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
-import { writeBatchFile } from '@/lib/util/batchWriter'
+import { writeStartupScript } from '@/lib/util/batchWriter'
 
 const tempDir = path.join(os.tmpdir(), 'service-manager')
 
-describe('batchWriter', () => {
+/** Returns the inner bat path derived from the outer bat path (service-ID.bat → service-ID-cmd.bat). */
+function innerBatPath(scriptFile: string): string {
+  return scriptFile.replace(/\.bat$/, '-cmd.bat')
+}
+
+describe('batchWriter — writeStartupScript', () => {
   afterEach(() => {
-    // clean up test batch files
-    const files = fs.readdirSync(tempDir).filter(f => f.startsWith('service-test-'))
-    files.forEach(f => fs.unlinkSync(path.join(tempDir, f)))
+    // clean up test script files and log files
+    try {
+      const files = fs.readdirSync(tempDir).filter(f => f.startsWith('service-test-'))
+      files.forEach(f => fs.unlinkSync(path.join(tempDir, f)))
+    } catch { /* tempDir may not exist */ }
   })
 
-  it('writes command without env vars', () => {
-    const batFile = writeBatchFile('test-1', 'echo hello', {})
-    const content = fs.readFileSync(batFile, 'utf-8')
-    expect(content).toBe('echo hello')
+  it('returns a scriptFile path and a logFile path', () => {
+    const { scriptFile, logFile } = writeStartupScript('test-1', 'echo hello', {})
+    expect(scriptFile).toContain('service-test-1.bat')
+    expect(logFile).toContain('service-test-1.log')
+    expect(fs.existsSync(scriptFile)).toBe(true)
   })
 
-  it('prepends PORT env var before command', () => {
-    const batFile = writeBatchFile('test-2', 'npm start', { PORT: '8080' })
-    const content = fs.readFileSync(batFile, 'utf-8')
-    expect(content).toContain('set PORT=8080')
-    expect(content).toContain('npm start')
-    expect(content.indexOf('set PORT=8080')).toBeLessThan(content.indexOf('npm start'))
+  it('inner bat contains the command', () => {
+    const { scriptFile } = writeStartupScript('test-2', 'npm start', {})
+    const inner = fs.readFileSync(innerBatPath(scriptFile), 'utf-8')
+    expect(inner).toContain('npm start')
   })
 
-  it('prepends CUDA_DEVICE env var before command', () => {
-    const batFile = writeBatchFile('test-3', 'python main.py', { CUDA_DEVICE: '1' })
-    const content = fs.readFileSync(batFile, 'utf-8')
-    expect(content).toContain('set CUDA_DEVICE=1')
-    expect(content).toContain('python main.py')
+  it('outer bat contains PORT env var; inner bat contains the command', () => {
+    const { scriptFile } = writeStartupScript('test-3', 'npm start', { PORT: '8080' })
+    const outer = fs.readFileSync(scriptFile, 'utf-8')
+    const inner = fs.readFileSync(innerBatPath(scriptFile), 'utf-8')
+    expect(outer).toContain('set PORT=8080')
+    // env var must appear before the call to the inner bat
+    expect(outer.indexOf('set PORT=8080')).toBeLessThan(outer.indexOf('call '))
+    expect(inner).toContain('npm start')
   })
 
-  it('prepends both PORT and CUDA_DEVICE when both provided', () => {
-    const batFile = writeBatchFile('test-4', 'run.bat', { PORT: '9090', CUDA_DEVICE: 'cuda1' })
-    const content = fs.readFileSync(batFile, 'utf-8')
-    expect(content).toContain('set PORT=9090')
-    expect(content).toContain('set CUDA_DEVICE=cuda1')
-    expect(content).toContain('run.bat')
+  it('outer bat contains CUDA_DEVICE env var; inner bat contains the command', () => {
+    const { scriptFile } = writeStartupScript('test-4', 'python main.py', { CUDA_DEVICE: '1' })
+    const outer = fs.readFileSync(scriptFile, 'utf-8')
+    const inner = fs.readFileSync(innerBatPath(scriptFile), 'utf-8')
+    expect(outer).toContain('set CUDA_DEVICE=1')
+    expect(inner).toContain('python main.py')
   })
 
-  it('writes to expected temp path', () => {
-    const batFile = writeBatchFile('test-5', 'echo hi', {})
-    expect(batFile).toContain('service-test-5.bat')
-    expect(fs.existsSync(batFile)).toBe(true)
+  it('outer bat redirects output to the log file via call >> logfile', () => {
+    const { scriptFile, logFile } = writeStartupScript('test-5', 'echo hi', {})
+    const outer = fs.readFileSync(scriptFile, 'utf-8')
+    expect(outer).toContain('>>')
+    expect(outer).toContain(logFile)
+  })
+
+  it('outer bat truncates the log file before calling the inner bat', () => {
+    const { scriptFile } = writeStartupScript('test-6', 'echo hi', {})
+    const outer = fs.readFileSync(scriptFile, 'utf-8')
+    const truncateIdx = outer.indexOf('type nul')
+    const callIdx = outer.indexOf('>>')
+    expect(truncateIdx).toBeGreaterThan(-1)
+    expect(truncateIdx).toBeLessThan(callIdx)
+  })
+
+  it('writes multi-line commands entirely to the inner bat so all lines are redirected', () => {
+    const multiLineCmd = 'cd C:\\myproject\npip install -r requirements.txt\npython main.py'
+    const { scriptFile } = writeStartupScript('test-7', multiLineCmd, {})
+    const inner = fs.readFileSync(innerBatPath(scriptFile), 'utf-8')
+    expect(inner).toContain('cd C:\\myproject')
+    expect(inner).toContain('pip install -r requirements.txt')
+    expect(inner).toContain('python main.py')
+    // The outer bat must use call ... >> to redirect all output
+    const outer = fs.readFileSync(scriptFile, 'utf-8')
+    expect(outer).toContain('call ')
+    expect(outer).toContain('>>')
+  })
+
+  it('sets PYTHONUNBUFFERED=1 in the outer bat before calling the inner bat', () => {
+    const { scriptFile } = writeStartupScript('test-8', 'python main.py', {})
+    const outer = fs.readFileSync(scriptFile, 'utf-8')
+    expect(outer).toContain('set PYTHONUNBUFFERED=1')
+    // PYTHONUNBUFFERED must appear before the call so it is in scope for the inner bat
+    expect(outer.indexOf('set PYTHONUNBUFFERED=1')).toBeLessThan(outer.indexOf('call '))
   })
 })

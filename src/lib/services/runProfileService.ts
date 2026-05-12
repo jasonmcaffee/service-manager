@@ -1,23 +1,8 @@
 import { processManager } from '@/lib/process-manager'
 import { runProfileRepository, UpsertProfileServiceInput } from '@/lib/repositories/runProfileRepository'
 import { serviceRepository } from '@/lib/repositories/serviceRepository'
-
-export async function ensureDefaultProfile(): Promise<void> {
-  const count = await runProfileRepository.count()
-  if (count > 0) return
-
-  const profile = await runProfileRepository.create('Default')
-  await runProfileRepository.setActive(profile.id)
-
-  // Migrate existing service data (cudaDevice/startOnBoot from legacy columns)
-  const services = await serviceRepository.findAll()
-  for (const service of services) {
-    await runProfileRepository.upsertProfileService(profile.id, service.id, {
-      cudaDevice: (service as any).cudaDevice ?? null,
-      startOnBoot: (service as any).startOnBoot ?? false,
-    })
-  }
-}
+import { initializeIfNeeded, ensureDefaultProfile } from '@/lib/services/init'
+import { diffProfiles, EffectiveConfig } from '@/lib/services/profileDiff'
 
 function buildEnv(port: number | null | undefined, cudaDevice: string | null | undefined): Record<string, string> {
   const env: Record<string, string> = {}
@@ -31,6 +16,31 @@ function makeOnStateChange(id: string) {
     await serviceRepository.update(id, { status, pid: pid ?? null })
   }
 }
+
+/**
+ * Builds an EffectiveConfig array for every service under the given profile.
+ * Merges global fields (command, port) with profile-specific overrides (cudaDevice, startOnBoot).
+ * @param profileId - the profile to build configs for
+ */
+async function buildEffectiveConfigs(profileId: string): Promise<EffectiveConfig[]> {
+  const [allServices, profile] = await Promise.all([
+    serviceRepository.findAll(),
+    runProfileRepository.findById(profileId),
+  ])
+
+  return allServices.map(svc => {
+    const override = profile?.services.find(s => s.serviceId === svc.id)
+    return {
+      serviceId: svc.id,
+      command: svc.command,
+      port: svc.port,
+      cudaDevice: override?.cudaDevice ?? null,
+      startOnBoot: override?.startOnBoot ?? false,
+    }
+  })
+}
+
+export { ensureDefaultProfile }
 
 export const runProfileService = {
   async listProfiles() {
@@ -58,6 +68,8 @@ export const runProfileService = {
   },
 
   async switchProfile(id: string) {
+    await initializeIfNeeded()
+
     const exists = await runProfileRepository.findById(id)
     if (!exists) {
       const err = new Error(`Profile not found: ${id}`)
@@ -65,34 +77,46 @@ export const runProfileService = {
       throw err
     }
 
-    // Stop all running services
-    const allServices = await serviceRepository.findAll()
-    for (const service of allServices) {
-      if (processManager.isRunning(service.id)) {
-        await processManager.stopService(service.id, makeOnStateChange(service.id))
-      }
-    }
+    const prevProfile = await runProfileRepository.findActive()
+    const prevId = prevProfile?.id ?? id
 
-    // Switch active profile
+    const [prevConfigs, nextConfigs] = await Promise.all([
+      buildEffectiveConfigs(prevId),
+      buildEffectiveConfigs(id),
+    ])
+
+    const actions = diffProfiles(prevConfigs, nextConfigs, sid => processManager.isRunning(sid))
+
+    // Switch the active profile before spawning so env vars resolve correctly
     const profile = await runProfileRepository.setActive(id)
 
-    // Start autostart services for the new profile
-    const autoStartEntries = await runProfileRepository.findAutoStartServices(id)
     const results: Array<{ id: string; name: string; status: string; error?: string }> = []
 
-    for (const entry of autoStartEntries) {
-      const service = entry.service
+    for (const [serviceId, action] of actions) {
+      if (action === 'noop') continue
+
+      const nextCfg = nextConfigs.find(c => c.serviceId === serviceId)
+      const service = await serviceRepository.findById(serviceId)
+      if (!service) continue
+
+      const env = buildEnv(nextCfg?.port, nextCfg?.cudaDevice)
+      const onStateChange = makeOnStateChange(serviceId)
+
       try {
-        await processManager.startService(
-          service.id,
-          service.command,
-          buildEnv(service.port, entry.cudaDevice),
-          makeOnStateChange(service.id)
-        )
-        results.push({ id: service.id, name: service.name, status: 'started' })
-        await new Promise(resolve => setTimeout(resolve, 500))
+        if (action === 'stop') {
+          await processManager.stopService(serviceId, onStateChange)
+          results.push({ id: serviceId, name: service.name, status: 'stopped' })
+        } else if (action === 'start') {
+          await processManager.startService(serviceId, service.command, env, onStateChange)
+          results.push({ id: serviceId, name: service.name, status: 'started' })
+          await new Promise(resolve => setTimeout(resolve, 500))
+        } else if (action === 'restart') {
+          await processManager.restartService(serviceId, service.command, env, onStateChange)
+          results.push({ id: serviceId, name: service.name, status: 'restarted' })
+          await new Promise(resolve => setTimeout(resolve, 500))
+        }
       } catch (error: any) {
-        results.push({ id: service.id, name: service.name, status: 'error', error: error.message })
+        results.push({ id: serviceId, name: service.name, status: 'error', error: error.message })
       }
     }
 

@@ -9,7 +9,7 @@ const mockProcessManager = {
   getStatus: jest.fn(() => undefined),
   getOutput: jest.fn(() => []),
   clearOutput: jest.fn(),
-  restoreFromDb: jest.fn(),
+  adoptExternal: jest.fn(),
 }
 
 jest.mock('@/lib/process-manager', () => ({
@@ -27,9 +27,12 @@ jest.mock('@/lib/util/portHelper', () => ({
 const mockRepo = {
   findAll: jest.fn(async () => []),
   findById: jest.fn(async () => null),
-  create: jest.fn(async (data: any) => ({ id: 'test-id', ...data, createdAt: new Date(), updatedAt: new Date() })),
+  create: jest.fn(async (data: any) => ({ id: 'svc-1', ...data, createdAt: new Date(), updatedAt: new Date() })),
   update: jest.fn(async (id: string, data: any) => ({ id, ...data })),
   delete: jest.fn(async () => {}),
+  findByName: jest.fn(async () => null),
+  getPort: jest.fn(async () => null),
+  findByPort: jest.fn(async () => []),
 }
 
 jest.mock('@/lib/repositories/serviceRepository', () => ({
@@ -55,12 +58,17 @@ jest.mock('@/lib/repositories/runProfileRepository', () => ({
   runProfileRepository: mockProfileRepo,
 }))
 
-// Mock batchWriter
+// Mock batchWriter — new return shape
 jest.mock('@/lib/util/batchWriter', () => ({
-  writeBatchFile: jest.fn(() => '/tmp/service-manager/service-test.bat'),
+  writeStartupScript: jest.fn(() => ({ scriptFile: '/tmp/service-manager/service-test.bat', logFile: '/tmp/service-manager/logs/service-test.log' })),
 }))
 
-// Reset global init flag before each test
+// Mock init so initializeIfNeeded is a no-op in these unit tests
+jest.mock('@/lib/services/init', () => ({
+  initializeIfNeeded: jest.fn(async () => {}),
+  ensureDefaultProfile: jest.fn(async () => {}),
+}))
+
 beforeEach(() => {
   jest.clearAllMocks()
   mockProcessManager.hasBootStarted.mockReturnValue(false)
@@ -70,7 +78,6 @@ beforeEach(() => {
   mockProfileRepo.findActive.mockResolvedValue({ id: 'profile-1', name: 'Default', isActive: true, services: [] })
   mockProfileRepo.findProfileService.mockResolvedValue(null)
   mockProfileRepo.findAutoStartServices.mockResolvedValue([])
-  ;(globalThis as any).processManagerInitialized = false
 })
 
 import { serviceService } from '@/lib/services/serviceService'
@@ -115,7 +122,7 @@ describe('serviceService.runAutoStart', () => {
     expect(mockProcessManager.startService).not.toHaveBeenCalled()
   })
 
-  it('skips services already running', async () => {
+  it('skips services already running (adoption short-circuits spawn)', async () => {
     const svc = makeService()
     mockProfileRepo.findAutoStartServices.mockResolvedValue([
       { service: svc, cudaDevice: null, startOnBoot: true }
@@ -166,16 +173,12 @@ describe('serviceService.startService', () => {
   it('passes PORT env var when port is set', async () => {
     const svc = makeService({ port: 8080 })
     mockRepo.findById.mockResolvedValue(svc)
-    // No CUDA override from profile
     mockProfileRepo.findProfileService.mockResolvedValue(null)
 
     await serviceService.startService('svc-1')
 
     expect(mockProcessManager.startService).toHaveBeenCalledWith(
-      'svc-1',
-      'echo hello',
-      { PORT: '8080' },
-      expect.any(Function)
+      'svc-1', 'echo hello', { PORT: '8080' }, expect.any(Function)
     )
   })
 
@@ -187,10 +190,7 @@ describe('serviceService.startService', () => {
     await serviceService.startService('svc-1')
 
     expect(mockProcessManager.startService).toHaveBeenCalledWith(
-      'svc-1',
-      'echo hello',
-      { CUDA_DEVICE: 'cuda1' },
-      expect.any(Function)
+      'svc-1', 'echo hello', { CUDA_DEVICE: 'cuda1' }, expect.any(Function)
     )
   })
 
@@ -202,10 +202,7 @@ describe('serviceService.startService', () => {
     await serviceService.startService('svc-1')
 
     expect(mockProcessManager.startService).toHaveBeenCalledWith(
-      'svc-1',
-      'echo hello',
-      { PORT: '8080', CUDA_DEVICE: '1' },
-      expect.any(Function)
+      'svc-1', 'echo hello', { PORT: '8080', CUDA_DEVICE: '1' }, expect.any(Function)
     )
   })
 
@@ -217,10 +214,7 @@ describe('serviceService.startService', () => {
     await serviceService.startService('svc-1')
 
     expect(mockProcessManager.startService).toHaveBeenCalledWith(
-      'svc-1',
-      'echo hello',
-      {},
-      expect.any(Function)
+      'svc-1', 'echo hello', {}, expect.any(Function)
     )
   })
 })
@@ -249,7 +243,7 @@ describe('serviceService.createService', () => {
     expect(mockRepo.create).toHaveBeenCalledWith(expect.objectContaining({ port: 8080 }))
   })
 
-  it('creates RunProfileService rows for all profiles on service creation', async () => {
+  it('mirrors cudaDevice and startOnBoot to all profiles on service creation', async () => {
     mockRepo.create.mockResolvedValue(makeService())
     await serviceService.createService({ name: 'x', command: 'echo', cudaDevice: '0', startOnBoot: true })
     expect(mockProfileRepo.createProfileServicesForAllProfiles).toHaveBeenCalledWith(

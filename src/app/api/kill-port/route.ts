@@ -14,12 +14,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ message: `No process found on port ${port}` }, { status: 404 })
     }
 
-    const { killed, pids } = await killPort(port)
+    const { killed, pids, wsl } = await killPort(port)
 
     if (killed) {
+      const prefix = wsl ? 'WSL ' : ''
       return NextResponse.json({
-        message: `Killed PID${pids.length > 1 ? 's' : ''}: ${pids.join(', ')}`,
+        message: `Killed ${prefix}PID${pids.length > 1 ? 's' : ''}: ${pids.join(', ')}`,
         pids,
+        wsl,
       })
     } else {
       return NextResponse.json({ message: `No process found on port ${port}` }, { status: 404 })

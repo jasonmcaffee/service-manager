@@ -6,6 +6,8 @@ export interface Service {
   description: string | null
   command: string
   port: number | null
+  noPort: boolean
+  wsl: boolean
   // cudaDevice and startOnBoot are profile-specific, merged from the active RunProfile
   cudaDevice: string | null
   startOnBoot: boolean
