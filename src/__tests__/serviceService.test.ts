@@ -20,6 +20,10 @@ jest.mock('@/lib/process-manager', () => ({
 const mockKillPort = jest.fn(async () => ({ killed: true, pids: [1234] }))
 jest.mock('@/lib/util/portHelper', () => ({
   killPort: mockKillPort,
+  shutdownWsl: jest.fn(async () => {}),
+  killMatchingProcesses: jest.fn(async () => {}),
+  ensureWslPortProxy: jest.fn(async () => {}),
+  extractServiceDir: jest.fn((_cmd: string) => null),
   isPortListening: jest.fn(async () => false),
 }))
 

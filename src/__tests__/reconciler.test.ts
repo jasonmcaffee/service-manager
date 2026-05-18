@@ -7,13 +7,15 @@
 
 const mockVerifyHealthWithMaps = jest.fn(() => ({ healthy: true }))
 const mockMarkUnhealthy = jest.fn()
-const mockGetStatus = jest.fn(() => ({ status: 'running' }))
+const mockGetStatus = jest.fn((): any => ({ status: 'running' }))
+const mockAdoptExternal = jest.fn()
 
 jest.mock('@/lib/process-manager', () => ({
   processManager: {
     getStatus: mockGetStatus,
     verifyHealthWithMaps: mockVerifyHealthWithMaps,
     markUnhealthy: mockMarkUnhealthy,
+    adoptExternal: mockAdoptExternal,
   },
 }))
 
@@ -27,12 +29,14 @@ jest.mock('@/lib/repositories/serviceRepository', () => ({
   },
 }))
 
-const mockSnapshotWindows = jest.fn(async () => new Map<number, number[]>())
-const mockSnapshotWsl = jest.fn(async () => new Map<number, number[]>())
+const mockSnapshotWindows = jest.fn(async () => new Map<number, number[]>() as Map<number, number[]> | null)
+const mockSnapshotWsl = jest.fn(async () => new Map<number, number[]>() as Map<number, number[]> | null)
+const mockIsWslProxyPid = jest.fn(async () => false)
 
 jest.mock('@/lib/util/portHelper', () => ({
   snapshotWindowsListeners: mockSnapshotWindows,
   snapshotWslListeners: mockSnapshotWsl,
+  isWslProxyPid: mockIsWslProxyPid,
 }))
 
 jest.mock('@/lib/lifecycle', () => ({
@@ -115,6 +119,68 @@ describe('Reconciler.tick', () => {
     await reconciler.tick()
 
     expect(mockMarkUnhealthy).not.toHaveBeenCalled()
+    expect(mockUpdate).not.toHaveBeenCalled()
+  })
+
+  it('skips verification when the WSL snapshot returns null and the service is wsl-adopted', async () => {
+    // Reproduces the vllm-startup bug: a transient `wsl ss` failure must not flip
+    // a healthy wsl-adopted service to stopped.
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(null) // snapshot failed
+
+    const services = [{ id: 'vllm-id', port: 8080, status: 'running', wsl: true }]
+    mockFindAll.mockResolvedValue(services)
+    mockGetStatus.mockReturnValue({ status: 'running', adoption: 'wsl', pid: 12345 })
+
+    await reconciler.tick()
+
+    expect(mockVerifyHealthWithMaps).not.toHaveBeenCalled()
+    expect(mockMarkUnhealthy).not.toHaveBeenCalled()
+    expect(mockUpdate).not.toHaveBeenCalled()
+  })
+
+  it('late-adopts a service that DB says running but processManager has not tracked', async () => {
+    // Reproduces post-boot recovery: init-time adoption failed (snapshot empty) but
+    // the WSL service is actually still listening. Reconciler should adopt it
+    // rather than marking it stopped.
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map([[8080, [46947]]]))
+
+    const services = [{ id: 'vllm-id', port: 8080, status: 'running', wsl: true, name: 'vllm' }]
+    mockFindAll.mockResolvedValue(services)
+    mockGetStatus.mockReturnValue(undefined) // not tracked by processManager
+
+    await reconciler.tick()
+
+    expect(mockAdoptExternal).toHaveBeenCalledWith('vllm-id', 46947, 'wsl')
+    expect(mockUpdate).toHaveBeenCalledWith('vllm-id', { status: 'running', pid: 46947 })
+  })
+
+  it('marks a DB-running but absent service as stopped if no listener is on the port', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map()) // empty but command succeeded
+
+    const services = [{ id: 'dead-svc', port: 8080, status: 'running', wsl: true, name: 'dead' }]
+    mockFindAll.mockResolvedValue(services)
+    mockGetStatus.mockReturnValue(undefined)
+
+    await reconciler.tick()
+
+    expect(mockAdoptExternal).not.toHaveBeenCalled()
+    expect(mockUpdate).toHaveBeenCalledWith('dead-svc', { status: 'stopped', pid: null })
+  })
+
+  it('does not late-adopt when WSL snapshot failed for a wsl service (avoids false stopped)', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(null) // snapshot failed
+
+    const services = [{ id: 'vllm-id', port: 8080, status: 'running', wsl: true, name: 'vllm' }]
+    mockFindAll.mockResolvedValue(services)
+    mockGetStatus.mockReturnValue(undefined)
+
+    await reconciler.tick()
+
+    expect(mockAdoptExternal).not.toHaveBeenCalled()
     expect(mockUpdate).not.toHaveBeenCalled()
   })
 

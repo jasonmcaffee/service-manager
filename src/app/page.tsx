@@ -58,7 +58,9 @@ const SortableServiceCard = memo(function SortableServiceCard({ service, isColla
     </div>
   )
 }, (prev, next) => {
-  // Only re-render when this card's own data or UI state changes
+  // Only re-render when this card's own data or collapse state changes.
+  // Callback references are deliberately excluded — they are re-created on each
+  // parent render but their identity doesn't affect the rendered output.
   return (
     prev.service.id === next.service.id &&
     prev.service.status === next.service.status &&
@@ -71,11 +73,7 @@ const SortableServiceCard = memo(function SortableServiceCard({ service, isColla
     prev.service.command === next.service.command &&
     prev.service.cudaDevice === next.service.cudaDevice &&
     prev.service.startOnBoot === next.service.startOnBoot &&
-    prev.isCollapsed === next.isCollapsed &&
-    prev.onToggleCollapse === next.onToggleCollapse &&
-    prev.onUpdate === next.onUpdate &&
-    prev.onPatch === next.onPatch &&
-    prev.onEditClick === next.onEditClick
+    prev.isCollapsed === next.isCollapsed
   )
 })
 
@@ -196,23 +194,27 @@ export default function Home() {
     }
   }
 
-  const handleAddService = (service: Service) => {
-    setServices([...services, service])
-  }
+  // These three handlers must use functional setState so they don't close over a
+  // stale `services` snapshot. Memoized SortableServiceCard caches its props,
+  // including the version of `handleUpdateService` from its last render; without
+  // useCallback + functional updater, firing onUpdate could overwrite the array
+  // with stale data and visually revert every sibling card for one paint cycle.
+  const handleAddService = useCallback((service: Service) => {
+    setServices(prev => [...prev, service])
+  }, [])
 
-  const handleUpdateService = (updated: Service) => {
-    setServices(services.map(s => s.id === updated.id ? { ...s, ...updated } : s))
-    fetchServices()
-  }
+  const handleUpdateService = useCallback((updated: Service) => {
+    setServices(prev => prev.map(s => s.id === updated.id ? { ...s, ...updated } : s))
+  }, [])
 
   /** Applies a partial patch to a single card without refetching all services. */
   const applyServicePatch = useCallback((patch: Partial<Service> & { id: string }) => {
     setServices(prev => prev.map(s => s.id === patch.id ? { ...s, ...patch } : s))
   }, [])
 
-  const handleDeleteService = (id: string) => {
-    setServices(services.filter(s => s.id !== id))
-  }
+  const handleDeleteService = useCallback((id: string) => {
+    setServices(prev => prev.filter(s => s.id !== id))
+  }, [])
 
   const runningCount = services.filter(s => s.status === 'running').length
 

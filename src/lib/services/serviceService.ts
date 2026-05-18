@@ -3,7 +3,7 @@ import { processManager, ServiceStatus } from '@/lib/process-manager'
 import { serviceRepository, CreateServiceInput, UpdateServiceInput } from '@/lib/repositories/serviceRepository'
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { initializeIfNeeded } from '@/lib/services/init'
-import { killPort, getWslPidsOnPort, killWslPids } from '@/lib/util/portHelper'
+import { killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy } from '@/lib/util/portHelper'
 import { getLogFilePath } from '@/lib/util/logTailer'
 
 /**
@@ -37,20 +37,6 @@ async function buildEnvForService(serviceId: string, port: number | null | undef
   return env
 }
 
-/**
- * Kills any WSL processes still listening on the given port.
- * Required for WSL services: treeKill only reaches the Windows-side wsl.exe wrapper;
- * the actual Linux process inside the VM survives and keeps holding the port,
- * causing EADDRINUSE on the next start attempt.
- * @param port - WSL port to clear of lingering processes
- */
-async function killOrphanedWslProcesses(port: number): Promise<void> {
-  const pids = await getWslPidsOnPort(port)
-  if (pids.length > 0) {
-    console.log(`[serviceService] killing ${pids.length} orphaned WSL process(es) on port ${port}: ${pids.join(', ')}`)
-    await killWslPids(pids)
-  }
-}
 
 function validatePort(port: number | null | undefined) {
   if (port === undefined || port === null) return
@@ -96,20 +82,28 @@ export const serviceService = {
 
     return Promise.all(services.map(async (service) => {
       let { status, pid } = service
+      const mem = processManager.getStatus(service.id)
 
-      if (status === 'running') {
-        if (!processManager.isRunning(service.id)) {
-          status = 'stopped'
-          pid = null
-          await serviceRepository.update(service.id, { status: 'stopped', pid: null })
+      if (mem) {
+        // processManager has the service in this session — trust its view.
+        if (mem.status === 'running') {
+          if (processManager.isRunning(service.id)) {
+            status = 'running'
+            pid = mem.pid ?? pid
+          } else {
+            // Tracked but the child or PID is dead — definitive evidence to mark stopped.
+            status = 'stopped'
+            pid = null
+            await serviceRepository.update(service.id, { status: 'stopped', pid: null })
+          }
+        } else {
+          status = mem.status
+          pid = mem.pid ?? null
         }
       }
-
-      const mem = processManager.getStatus(service.id)
-      if (mem?.status === 'running' && mem.pid) {
-        status = 'running'
-        pid = mem.pid
-      }
+      // If mem is undefined we have no evidence either way. Report the DB status
+      // and let the reconciler attempt re-adoption / mark stopped with snapshots
+      // — that's the only place we have port-level ground truth.
 
       const merged = await mergeProfileOverride(service)
       return { ...merged, status, pid }
@@ -189,12 +183,18 @@ export const serviceService = {
       throw err
     }
 
-    if ((service as any).wsl && service.port) {
-      await killOrphanedWslProcesses(service.port)
+    if (service.port) {
+      if (!(service as any).wsl) {
+        const serviceDir = extractServiceDir(service.command)
+        if (serviceDir) await killMatchingProcesses(serviceDir, 'node_modules')
+      }
+      await killPort(service.port)
     }
 
     const env = await buildEnvForService(id, service.port)
     await processManager.startService(service.id, service.command, env, makeOnStateChange(id))
+
+    if ((service as any).wsl && service.port) await ensureWslPortProxy(service.port)
 
     const mem = processManager.getStatus(id)
     const updated = await serviceRepository.findById(id)
@@ -222,7 +222,7 @@ export const serviceService = {
     }
 
     if ((service as any).wsl && service.port) {
-      await killOrphanedWslProcesses(service.port)
+      await killPort(service.port)
     }
 
     const mem = processManager.getStatus(id)
@@ -242,12 +242,18 @@ export const serviceService = {
       throw err
     }
 
-    if ((service as any).wsl && service.port) {
-      await killOrphanedWslProcesses(service.port)
+    if (service.port) {
+      if (!(service as any).wsl) {
+        const serviceDir = extractServiceDir(service.command)
+        if (serviceDir) await killMatchingProcesses(serviceDir, 'node_modules')
+      }
+      await killPort(service.port)
     }
 
     const env = await buildEnvForService(id, service.port)
     await processManager.restartService(service.id, service.command, env, makeOnStateChange(id))
+
+    if ((service as any).wsl && service.port) await ensureWslPortProxy(service.port)
 
     const mem = processManager.getStatus(id)
     const updated = await serviceRepository.findById(id)
@@ -284,8 +290,12 @@ export const serviceService = {
         if (service.port) env.PORT = String(service.port)
         if (entry.cudaDevice) env.CUDA_DEVICE = entry.cudaDevice
 
-        if ((service as any).wsl && service.port) {
-          await killOrphanedWslProcesses(service.port)
+        if (service.port) {
+          if (!(service as any).wsl) {
+            const serviceDir = extractServiceDir(service.command)
+            if (serviceDir) await killMatchingProcesses(serviceDir, 'node_modules')
+          }
+          await killPort(service.port)
         }
 
         await processManager.startService(
@@ -294,6 +304,7 @@ export const serviceService = {
           env,
           makeOnStateChange(service.id)
         )
+        if ((service as any).wsl && service.port) await ensureWslPortProxy(service.port)
         results.push({ id: service.id, name: service.name, status: 'started' })
         await new Promise(resolve => setTimeout(resolve, 1000))
       } catch (error: any) {
@@ -304,8 +315,18 @@ export const serviceService = {
     return { alreadyStarted: false, results }
   },
 
+  /**
+   * Returns recent output for a service. Prefers the live tailer ring-buffer (fast,
+   * has the most-recent lines); falls back to the persisted log file when the
+   * tailer hasn't been started (e.g. an unadopted service or one that died
+   * before adoption). Without this fallback the terminal goes blank for any
+   * service that failed to adopt — hiding error logs the user needs.
+   * @param id - service id
+   */
   getOutput(id: string) {
-    return processManager.getOutput(id)
+    const buffered = processManager.getOutput(id)
+    if (buffered.length > 0) return buffered
+    return readLogFileLines(id).filter(l => l.length > 0).slice(-1000)
   },
 
   clearOutput(id: string) {

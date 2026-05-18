@@ -76,6 +76,13 @@ jest.mock('@/lib/repositories/runProfileRepository', () => ({
 
 jest.mock('@/lib/util/portHelper', () => ({
   killPort: jest.fn(async () => ({ killed: false, pids: [], wsl: false })),
+  shutdownWsl: jest.fn(async () => {}),
+  killMatchingProcesses: jest.fn(async () => {}),
+  ensureWslPortProxy: jest.fn(async () => {}),
+  extractServiceDir: jest.fn((cmd: string) => {
+    const m = cmd.match(/cd\s+(?:\/d\s+)?(?:"([^"]+)"|'([^']+)'|([^\s\r\n]+))/i)
+    return m?.[1] ?? m?.[2] ?? m?.[3] ?? null
+  }),
   getWslPidsOnPort: jest.fn(async () => [] as number[]),
   killWslPids: jest.fn(async () => [] as number[]),
   isWslProxyPid: jest.fn(async () => false),
@@ -175,10 +182,35 @@ describe('serviceService.startService', () => {
     })
   })
 
-  it('kills orphaned WSL processes before starting a WSL service', async () => {
-    const { getWslPidsOnPort, killWslPids } = require('@/lib/util/portHelper')
-    getWslPidsOnPort.mockResolvedValue([9001, 9002])
-    killWslPids.mockResolvedValue([9001, 9002])
+  it('kills port before starting any service with a port (clears watch-mode restarters)', async () => {
+    const { killPort, shutdownWsl } = require('@/lib/util/portHelper')
+
+    const svc = makeService({ wsl: false, port: 8080 })
+    mockFindById.mockResolvedValue(svc)
+    mockGetStatus.mockReturnValue({ status: 'running', pid: 123 })
+
+    await serviceService.startService('test-svc-id')
+
+    expect(shutdownWsl).not.toHaveBeenCalled()
+    expect(killPort).toHaveBeenCalledWith(8080)
+  })
+
+  it('kills matching watcher processes before starting a non-WSL service with a cd command', async () => {
+    const { killMatchingProcesses, killPort, shutdownWsl } = require('@/lib/util/portHelper')
+
+    const svc = makeService({ wsl: false, port: 4141, command: 'cd /d C:\\jason\\dev\\ai-proxy\nnpm run start:dev' })
+    mockFindById.mockResolvedValue(svc)
+    mockGetStatus.mockReturnValue({ status: 'running', pid: 123 })
+
+    await serviceService.startService('test-svc-id')
+
+    expect(shutdownWsl).not.toHaveBeenCalled()
+    expect(killMatchingProcesses).toHaveBeenCalledWith('C:\\jason\\dev\\ai-proxy', 'node_modules')
+    expect(killPort).toHaveBeenCalledWith(4141)
+  })
+
+  it('kills port before starting a WSL service without shutting down WSL', async () => {
+    const { killPort, shutdownWsl } = require('@/lib/util/portHelper')
 
     const svc = makeService({ wsl: true, port: 8080 })
     mockFindById.mockResolvedValue(svc)
@@ -186,7 +218,8 @@ describe('serviceService.startService', () => {
 
     await serviceService.startService('test-svc-id')
 
-    expect(killWslPids).toHaveBeenCalledWith([9001, 9002])
+    expect(shutdownWsl).not.toHaveBeenCalled()
+    expect(killPort).toHaveBeenCalledWith(8080)
   })
 })
 
@@ -410,16 +443,32 @@ describe('serviceService.createService', () => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe('serviceService.listServices — status reconciliation', () => {
-  it('overrides DB status=running with stopped when processManager says not running', async () => {
+  it('marks stopped when processManager has a tracked but dead process (spawned child exited)', async () => {
     const svc = makeService({ status: 'running', pid: 999 })
     mockFindAll.mockResolvedValue([svc])
+    // mem present (tracked), but isRunning false => spawned child died or PID dead
+    mockGetStatus.mockReturnValue({ status: 'running', pid: 999, process: null, id: svc.id })
     mockIsRunning.mockReturnValue(false)
-    mockGetStatus.mockReturnValue(undefined)
 
     const [result] = await serviceService.listServices()
 
     expect(result.status).toBe('stopped')
     expect(result.pid).toBeNull()
+  })
+
+  it('trusts DB=running when processManager has no entry (adoption hasn\'t happened yet)', async () => {
+    // Reproduces the vllm-startup bug: a WSL service whose adoption failed
+    // (e.g. transient `wsl` snapshot failure) must NOT be flipped to stopped here.
+    // The reconciler is the authority for that decision.
+    const svc = makeService({ status: 'running', pid: 999 })
+    mockFindAll.mockResolvedValue([svc])
+    mockGetStatus.mockReturnValue(undefined) // never adopted in this session
+    mockIsRunning.mockReturnValue(false)
+
+    const [result] = await serviceService.listServices()
+
+    expect(result.status).toBe('running')
+    expect(result.pid).toBe(999)
   })
 
   it('overrides DB status with in-memory running status', async () => {

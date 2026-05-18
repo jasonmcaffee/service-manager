@@ -73,12 +73,28 @@ export interface AdoptionReport {
  * Scans OS listeners once (Windows + WSL) and adopts any service whose port
  * is already occupied — preventing EADDRINUSE on service-manager restarts.
  * Uses claim-tracking to ensure one PID is never adopted by two services.
+ * Retries the WSL/Windows snapshot once if it fails, so a slow first `wsl`
+ * call doesn't leave WSL services unadopted at boot.
  */
 async function adoptRunningServices(): Promise<AdoptionReport> {
-  const [winMap, wslMap] = await Promise.all([
+  let [winMap, wslMap] = await Promise.all([
     snapshotWindowsListeners(),
     snapshotWslListeners(),
   ])
+
+  // Retry once if either snapshot failed — `wsl` can be slow to wake on cold boot
+  // and a single retry typically succeeds. Without this, vllm and other WSL
+  // services aren't adopted and get incorrectly marked stopped.
+  if (winMap === null || wslMap === null) {
+    console.log('[init] snapshot returned null, retrying after 500ms (winMap=%s, wslMap=%s)', winMap !== null, wslMap !== null)
+    await new Promise(r => setTimeout(r, 500))
+    const [winRetry, wslRetry] = await Promise.all([
+      winMap === null ? snapshotWindowsListeners() : Promise.resolve(winMap),
+      wslMap === null ? snapshotWslListeners() : Promise.resolve(wslMap),
+    ])
+    winMap = winRetry
+    wslMap = wslRetry
+  }
 
   const services = await serviceRepository.findAll()
   const active = await runProfileRepository.findActive()
@@ -95,6 +111,18 @@ async function adoptRunningServices(): Promise<AdoptionReport> {
     }
     if (processManager.isRunning(svc.id)) continue
 
+    // Skip services whose required snapshot is unavailable so we don't accidentally
+    // treat "command failed" as "nothing listening" and trigger an unnecessary kill+restart.
+    if ((svc as any).wsl && wslMap === null) {
+      report.skipped.push({ serviceId: svc.id, reason: 'wsl-snapshot-failed' })
+      console.warn(`[init] skipping adoption check for WSL service "${svc.name}" — wsl snapshot failed`)
+      continue
+    }
+    if (!(svc as any).wsl && winMap === null && wslMap === null) {
+      report.skipped.push({ serviceId: svc.id, reason: 'both-snapshots-failed' })
+      continue
+    }
+
     // Port-level claim: even if two services resolve to different PIDs/maps on
     // the same port (e.g. a WSL service and the Windows port-forwarding proxy),
     // only one service may hold a given port at a time.
@@ -104,8 +132,8 @@ async function adoptRunningServices(): Promise<AdoptionReport> {
       continue
     }
 
-    const rawWinPid = winMap.get(svc.port)?.[0]
-    const wslPid = wslMap.get(svc.port)?.[0]
+    const rawWinPid = winMap?.get(svc.port)?.[0]
+    const wslPid = wslMap?.get(svc.port)?.[0]
 
     // Filter out Windows PIDs that belong to svchost (WSL's port-forwarding proxy
     // via iphlpsvc). svchost stays on the port even when the WSL service has stopped,

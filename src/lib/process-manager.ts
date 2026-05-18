@@ -104,8 +104,7 @@ class ProcessManager extends EventEmitter {
    */
   adoptNoPort(serviceId: string): void {
     const logFile = getLogFilePath(serviceId)
-    const marker = `[Adopted log-alive noPort process at ${new Date().toISOString()}]\n`
-    try { fs.appendFileSync(logFile, marker) } catch { /* log dir may not exist yet */ }
+    console.log(`[process-manager] adoptNoPort ${serviceId}`)
 
     logTailer.start(serviceId, logFile, true)
 
@@ -128,8 +127,7 @@ class ProcessManager extends EventEmitter {
    */
   adoptExternal(serviceId: string, pid: number, kind: AdoptionKind): void {
     const logFile = getLogFilePath(serviceId)
-    const marker = `[Adopted external ${kind} process pid=${pid} at ${new Date().toISOString()}]\n`
-    try { fs.appendFileSync(logFile, marker) } catch { /* log dir may not exist yet */ }
+    console.log(`[process-manager] adoptExternal ${serviceId} pid=${pid} kind=${kind}`)
 
     logTailer.start(serviceId, logFile, true) // fromStart:true — load recent history so terminal isn't blank
 

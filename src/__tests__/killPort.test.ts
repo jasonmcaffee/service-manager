@@ -87,20 +87,31 @@ describe('getWindowsPidsOnPort', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 describe('getWslPidsOnPort', () => {
   it('returns WSL PIDs from ss output for the given port', async () => {
-    mockExecFileAsync.mockResolvedValue({
-      stdout: [
-        ssLine(8080, 9001),
-        ssLine(8080, 9002),
-      ].join('\n'),
-      stderr: '',
-    })
+    // First call: ss -tlnp; second call: fuser (nothing extra)
+    mockExecFileAsync
+      .mockResolvedValueOnce({
+        stdout: [ssLine(8080, 9001), ssLine(8080, 9002)].join('\n'),
+        stderr: '',
+      })
+      .mockResolvedValueOnce({ stdout: '', stderr: '' }) // fuser — nothing extra
     const pids = await getWslPidsOnPort(8080)
     expect(pids).toContain(9001)
     expect(pids).toContain(9002)
   })
 
+  it('returns PIDs found by fuser even if ss shows nothing (non-LISTEN socket states)', async () => {
+    // ss finds nothing (LISTEN state); fuser finds a process in CLOSE_WAIT
+    mockExecFileAsync
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })       // ss — nothing
+      .mockResolvedValueOnce({ stdout: '42424', stderr: '' })  // fuser — PID in CLOSE_WAIT
+    const pids = await getWslPidsOnPort(8080)
+    expect(pids).toContain(42424)
+  })
+
   it('returns empty array when no WSL process is on the port', async () => {
-    mockExecFileAsync.mockResolvedValue({ stdout: ssLine(9999, 1111), stderr: '' })
+    mockExecFileAsync
+      .mockResolvedValueOnce({ stdout: ssLine(9999, 1111), stderr: '' }) // ss — wrong port
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                  // fuser — nothing
     const pids = await getWslPidsOnPort(8080)
     expect(pids).toEqual([])
   })
@@ -122,7 +133,9 @@ describe('isPortListening', () => {
 
   it('returns true when only a WSL process is listening (no Windows process)', async () => {
     mockExecAsync.mockResolvedValue({ stdout: '', stderr: '' })
-    mockExecFileAsync.mockResolvedValue({ stdout: ssLine(8080, 222), stderr: '' })
+    mockExecFileAsync
+      .mockResolvedValueOnce({ stdout: ssLine(8080, 222), stderr: '' }) // ss call
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                 // fuser call
     expect(await isPortListening(8080)).toBe(true)
   })
 
@@ -138,6 +151,7 @@ describe('killPort — kills BOTH Windows and WSL processes', () => {
   it('kills Windows PID when only a Windows process is present', async () => {
     // netstat finds a Windows PID, wsl ss finds nothing
     mockExecAsync
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                                  // deletePortProxyRulesOnPort — no rules
       .mockResolvedValueOnce({ stdout: netstatLine('0.0.0.0:8080', 5000), stderr: '' }) // getWindowsPidsOnPort
       .mockResolvedValueOnce({ stdout: '', stderr: '' }) // taskkill success
     mockExecFileAsync.mockResolvedValue({ stdout: '', stderr: '' }) // wsl ss — nothing
@@ -151,9 +165,10 @@ describe('killPort — kills BOTH Windows and WSL processes', () => {
 
   it('kills WSL PID when only a WSL process is present', async () => {
     // netstat finds nothing, wsl ss finds a WSL PID
-    mockExecAsync.mockResolvedValue({ stdout: '', stderr: '' }) // netstat + taskkill
+    mockExecAsync.mockResolvedValue({ stdout: '', stderr: '' }) // netstat + taskkill + portproxy show
     mockExecFileAsync
-      .mockResolvedValueOnce({ stdout: ssLine(8080, 7001), stderr: '' }) // getWslPidsOnPort
+      .mockResolvedValueOnce({ stdout: ssLine(8080, 7001), stderr: '' }) // getWslPidsOnPort — ss
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                 // getWslPidsOnPort — fuser
       .mockResolvedValueOnce({ stdout: '', stderr: '' })                 // wsl kill -9
 
     const result = await killPort(8080)
@@ -169,10 +184,12 @@ describe('killPort — kills BOTH Windows and WSL processes', () => {
     const WSL_PID = 8888  // vllm inside WSL
 
     mockExecAsync
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                                    // deletePortProxyRulesOnPort — no rules
       .mockResolvedValueOnce({ stdout: netstatLine('0.0.0.0:8080', WIN_PID), stderr: '' }) // getWindowsPidsOnPort
       .mockResolvedValueOnce({ stdout: '', stderr: '' }) // taskkill WIN_PID
     mockExecFileAsync
-      .mockResolvedValueOnce({ stdout: ssLine(8080, WSL_PID), stderr: '' }) // getWslPidsOnPort
+      .mockResolvedValueOnce({ stdout: ssLine(8080, WSL_PID), stderr: '' }) // getWslPidsOnPort — ss
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                    // getWslPidsOnPort — fuser
       .mockResolvedValueOnce({ stdout: '', stderr: '' })                    // wsl kill -9 WSL_PID
 
     const result = await killPort(8080)
@@ -186,8 +203,9 @@ describe('killPort — kills BOTH Windows and WSL processes', () => {
   it('returns wsl=true when at least one WSL process was killed', async () => {
     mockExecAsync.mockResolvedValue({ stdout: '', stderr: '' })
     mockExecFileAsync
-      .mockResolvedValueOnce({ stdout: ssLine(8080, 5555), stderr: '' })
-      .mockResolvedValueOnce({ stdout: '', stderr: '' })
+      .mockResolvedValueOnce({ stdout: ssLine(8080, 5555), stderr: '' }) // ss
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                  // fuser
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                  // wsl kill -9
 
     const result = await killPort(8080)
 
@@ -196,6 +214,7 @@ describe('killPort — kills BOTH Windows and WSL processes', () => {
 
   it('returns wsl=false when only Windows processes were killed', async () => {
     mockExecAsync
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                                   // deletePortProxyRulesOnPort — no rules
       .mockResolvedValueOnce({ stdout: netstatLine('0.0.0.0:8080', 1234), stderr: '' })
       .mockResolvedValueOnce({ stdout: '', stderr: '' })
     mockExecFileAsync.mockResolvedValue({ stdout: '', stderr: '' })
@@ -218,10 +237,12 @@ describe('killPort — kills BOTH Windows and WSL processes', () => {
   it('still kills WSL process even if Windows taskkill fails', async () => {
     const WSL_PID = 7777
     mockExecAsync
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                                  // deletePortProxyRulesOnPort — no rules
       .mockResolvedValueOnce({ stdout: netstatLine('0.0.0.0:8080', 4444), stderr: '' }) // getWindowsPids
       .mockRejectedValueOnce(new Error('taskkill: process not found'))                  // taskkill fails
     mockExecFileAsync
-      .mockResolvedValueOnce({ stdout: ssLine(8080, WSL_PID), stderr: '' }) // getWslPids
+      .mockResolvedValueOnce({ stdout: ssLine(8080, WSL_PID), stderr: '' }) // getWslPids — ss
+      .mockResolvedValueOnce({ stdout: '', stderr: '' })                    // getWslPids — fuser
       .mockResolvedValueOnce({ stdout: '', stderr: '' })                    // wsl kill succeeds
 
     const result = await killPort(8080)

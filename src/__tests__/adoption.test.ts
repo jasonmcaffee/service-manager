@@ -56,14 +56,16 @@ describe('snapshotWindowsListeners', () => {
 
   it('includes a port occupied by a running Node server', async () => {
     const map = await snapshotWindowsListeners()
-    expect(map.has(port)).toBe(true)
-    expect(map.get(port)!.length).toBeGreaterThan(0)
+    expect(map).not.toBeNull()
+    expect(map!.has(port)).toBe(true)
+    expect(map!.get(port)!.length).toBeGreaterThan(0)
   })
 
   it('does not include a port that is not listening', async () => {
     const freePort = await findFreePort()
     const map = await snapshotWindowsListeners()
-    expect(map.has(freePort)).toBe(false)
+    expect(map).not.toBeNull()
+    expect(map!.has(freePort)).toBe(false)
   })
 })
 
@@ -86,15 +88,14 @@ describe('processManager.adoptExternal', () => {
     expect(processManager.getStatus(SERVICE_ID)?.adoption).toBe('windows')
   })
 
-  it('writes an adoption marker to the log file', () => {
+  it('does NOT write an adoption marker to the log file (avoids duplicate entries on HMR cycles)', () => {
     const logFile = getLogFilePath(SERVICE_ID)
     if (fs.existsSync(logFile)) fs.unlinkSync(logFile)
 
     processManager.adoptExternal(SERVICE_ID, 12345, 'windows')
 
-    expect(fs.existsSync(logFile)).toBe(true)
-    const content = fs.readFileSync(logFile, 'utf-8')
-    expect(content).toMatch(/\[Adopted external windows process pid=12345/)
+    // No marker written — log stays clean across re-adoptions
+    expect(fs.existsSync(logFile)).toBe(false)
   })
 
   it('shows recent log history after adoption so terminal is not blank', () => {
@@ -105,7 +106,6 @@ describe('processManager.adoptExternal', () => {
 
     const output = processManager.getOutput(SERVICE_ID)
     expect(output.some(l => l.includes('historical line 1'))).toBe(true)
-    expect(output.some(l => l.includes('[Adopted external'))).toBe(true)
   })
 
   it('streams new lines written after adoption', async () => {
@@ -181,15 +181,14 @@ describe('processManager.adoptNoPort', () => {
     expect(processManager.getPid(SERVICE_ID)).toBeUndefined()
   })
 
-  it('writes an adoption marker to the log file', () => {
+  it('does NOT write an adoption marker to the log file (avoids duplicate entries on HMR cycles)', () => {
     const logFile = getLogFilePath(SERVICE_ID)
     if (fs.existsSync(logFile)) fs.unlinkSync(logFile)
 
     processManager.adoptNoPort(SERVICE_ID)
 
-    expect(fs.existsSync(logFile)).toBe(true)
-    const content = fs.readFileSync(logFile, 'utf-8')
-    expect(content).toMatch(/\[Adopted log-alive noPort process/)
+    // No marker written — log stays clean across re-adoptions
+    expect(fs.existsSync(logFile)).toBe(false)
   })
 
   it('shows recent log history after noPort adoption', () => {
@@ -200,7 +199,6 @@ describe('processManager.adoptNoPort', () => {
 
     const output = processManager.getOutput(SERVICE_ID)
     expect(output.some(l => l.includes('noport line 1'))).toBe(true)
-    expect(output.some(l => l.includes('[Adopted log-alive'))).toBe(true)
   })
 })
 
