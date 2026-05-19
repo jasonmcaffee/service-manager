@@ -1,13 +1,17 @@
 /**
  * Unit tests for the Reconciler background tick.
  * All dependencies are mocked — no real OS calls, no real processes.
+ *
+ * The reconciler's contract: the OS is the source of truth. Each tick must
+ * make backend state (processManager + DB) match what the OS shows on each
+ * service's port. The UI then paints backend state — no UI-only state.
  */
 
 // ── mocks ────────────────────────────────────────────────────────────────────
 
 const mockVerifyHealthWithMaps = jest.fn(() => ({ healthy: true }))
 const mockMarkUnhealthy = jest.fn()
-const mockGetStatus = jest.fn((): any => ({ status: 'running' }))
+const mockGetStatus = jest.fn((): any => undefined)
 const mockAdoptExternal = jest.fn()
 
 jest.mock('@/lib/process-manager', () => ({
@@ -58,40 +62,56 @@ afterEach(() => {
   reconciler.stop()
 })
 
-describe('Reconciler.tick', () => {
+describe('Reconciler.tick — snapshot behavior', () => {
   it('takes ONE port snapshot per tick regardless of service count', async () => {
-    const services = [
+    mockFindAll.mockResolvedValue([
       { id: 'a', port: 7070, status: 'running' },
       { id: 'b', port: 8080, status: 'running' },
       { id: 'c', port: 9090, status: 'running' },
-    ]
-    mockFindAll.mockResolvedValue(services)
+    ])
     mockGetStatus.mockReturnValue({ status: 'running' })
-    mockVerifyHealthWithMaps.mockReturnValue({ healthy: true })
 
     await reconciler.tick()
 
-    // One call each, not one per service
     expect(mockSnapshotWindows).toHaveBeenCalledTimes(1)
     expect(mockSnapshotWsl).toHaveBeenCalledTimes(1)
   })
 
-  it('skips services that are not running', async () => {
-    const services = [{ id: 'svc-1', port: 8080, status: 'stopped' }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue({ status: 'stopped' })
+  it('ignores noPort services (they use log-freshness, not port snapshots)', async () => {
+    mockFindAll.mockResolvedValue([
+      { id: 'noport-svc', port: null, status: 'running' },
+    ])
+    mockGetStatus.mockReturnValue(undefined)
 
     await reconciler.tick()
 
-    expect(mockVerifyHealthWithMaps).not.toHaveBeenCalled()
     expect(mockMarkUnhealthy).not.toHaveBeenCalled()
+    expect(mockAdoptExternal).not.toHaveBeenCalled()
+    expect(mockUpdate).not.toHaveBeenCalled()
+  })
+})
+
+describe('Reconciler.tick — OS as source of truth', () => {
+  it('does nothing when service is stopped and no listener is on its port', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map())
+
+    mockFindAll.mockResolvedValue([{ id: 'svc-1', port: 8080, status: 'stopped', wsl: true }])
+    mockGetStatus.mockReturnValue(undefined)
+
+    await reconciler.tick()
+
+    expect(mockMarkUnhealthy).not.toHaveBeenCalled()
+    expect(mockAdoptExternal).not.toHaveBeenCalled()
+    expect(mockUpdate).not.toHaveBeenCalled()
   })
 
-  it('marks unhealthy + updates DB when port is not bound', async () => {
-    const services = [{ id: 'vllm-id', port: 8080, status: 'running' }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue({ status: 'running' })
-    mockVerifyHealthWithMaps.mockReturnValue({ healthy: false, reason: 'port-not-bound' })
+  it('marks a DB=running service stopped when no listener is on its port', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map())
+
+    mockFindAll.mockResolvedValue([{ id: 'vllm-id', port: 8080, status: 'running', wsl: true }])
+    mockGetStatus.mockReturnValue({ status: 'running', adoption: 'wsl', pid: 12345 })
 
     await reconciler.tick()
 
@@ -99,56 +119,24 @@ describe('Reconciler.tick', () => {
     expect(mockUpdate).toHaveBeenCalledWith('vllm-id', { status: 'stopped', pid: null })
   })
 
-  it('marks unhealthy when port is taken by a different PID', async () => {
-    const services = [{ id: 'svc-1', port: 9999, status: 'running' }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue({ status: 'running' })
-    mockVerifyHealthWithMaps.mockReturnValue({ healthy: false, reason: 'port-taken-by-other-pid' })
-
-    await reconciler.tick()
-
-    expect(mockMarkUnhealthy).toHaveBeenCalledWith('svc-1', 'port-taken-by-other-pid')
-  })
-
-  it('leaves healthy services alone', async () => {
-    const services = [{ id: 'svc-ok', port: 7070, status: 'running' }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue({ status: 'running' })
-    mockVerifyHealthWithMaps.mockReturnValue({ healthy: true })
-
-    await reconciler.tick()
-
-    expect(mockMarkUnhealthy).not.toHaveBeenCalled()
-    expect(mockUpdate).not.toHaveBeenCalled()
-  })
-
-  it('skips verification when the WSL snapshot returns null and the service is wsl-adopted', async () => {
-    // Reproduces the vllm-startup bug: a transient `wsl ss` failure must not flip
-    // a healthy wsl-adopted service to stopped.
+  it('preserves DB=error status when no listener (does not clobber error info with stopped)', async () => {
     mockSnapshotWindows.mockResolvedValueOnce(new Map())
-    mockSnapshotWsl.mockResolvedValueOnce(null) // snapshot failed
+    mockSnapshotWsl.mockResolvedValueOnce(new Map())
 
-    const services = [{ id: 'vllm-id', port: 8080, status: 'running', wsl: true }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue({ status: 'running', adoption: 'wsl', pid: 12345 })
+    mockFindAll.mockResolvedValue([{ id: 'crashed-svc', port: 8080, status: 'error', wsl: true }])
+    mockGetStatus.mockReturnValue({ status: 'error', adoption: undefined, pid: undefined })
 
     await reconciler.tick()
 
-    expect(mockVerifyHealthWithMaps).not.toHaveBeenCalled()
-    expect(mockMarkUnhealthy).not.toHaveBeenCalled()
     expect(mockUpdate).not.toHaveBeenCalled()
   })
 
-  it('late-adopts a service that DB says running but processManager has not tracked', async () => {
-    // Reproduces post-boot recovery: init-time adoption failed (snapshot empty) but
-    // the WSL service is actually still listening. Reconciler should adopt it
-    // rather than marking it stopped.
+  it('adopts a service whose listener appears on its port (DB was previously running)', async () => {
     mockSnapshotWindows.mockResolvedValueOnce(new Map())
     mockSnapshotWsl.mockResolvedValueOnce(new Map([[8080, [46947]]]))
 
-    const services = [{ id: 'vllm-id', port: 8080, status: 'running', wsl: true, name: 'vllm' }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue(undefined) // not tracked by processManager
+    mockFindAll.mockResolvedValue([{ id: 'vllm-id', port: 8080, status: 'running', wsl: true, name: 'vllm' }])
+    mockGetStatus.mockReturnValue(undefined)
 
     await reconciler.tick()
 
@@ -156,48 +144,94 @@ describe('Reconciler.tick', () => {
     expect(mockUpdate).toHaveBeenCalledWith('vllm-id', { status: 'running', pid: 46947 })
   })
 
-  it('marks a DB-running but absent service as stopped if no listener is on the port', async () => {
+  it('adopts a service whose listener appears even when DB says stopped (vllm-survival case)', async () => {
+    // This is the user-reported bug: vllm's cmd.exe died (so we marked it stopped)
+    // but the WSL vllm process kept running. Reconciler must re-adopt to match OS.
     mockSnapshotWindows.mockResolvedValueOnce(new Map())
-    mockSnapshotWsl.mockResolvedValueOnce(new Map()) // empty but command succeeded
+    mockSnapshotWsl.mockResolvedValueOnce(new Map([[8080, [80924]]]))
 
-    const services = [{ id: 'dead-svc', port: 8080, status: 'running', wsl: true, name: 'dead' }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue(undefined)
+    mockFindAll.mockResolvedValue([{ id: 'vllm-id', port: 8080, status: 'stopped', wsl: true, name: 'vllm' }])
+    mockGetStatus.mockReturnValue({ status: 'stopped', adoption: undefined, pid: undefined, process: null })
+
+    await reconciler.tick()
+
+    expect(mockAdoptExternal).toHaveBeenCalledWith('vllm-id', 80924, 'wsl')
+    expect(mockUpdate).toHaveBeenCalledWith('vllm-id', { status: 'running', pid: 80924 })
+  })
+
+  it('re-adopts with a new pid when an adopted service\'s pid changed via internal restart', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map([[8080, [99999]]]))
+
+    mockFindAll.mockResolvedValue([{ id: 'vllm-id', port: 8080, status: 'running', wsl: true, pid: 46947, name: 'vllm' }])
+    mockGetStatus.mockReturnValue({ status: 'running', adoption: 'wsl', pid: 46947 })
+
+    await reconciler.tick()
+
+    expect(mockAdoptExternal).toHaveBeenCalledWith('vllm-id', 99999, 'wsl')
+    expect(mockUpdate).toHaveBeenCalledWith('vllm-id', { status: 'running', pid: 99999 })
+  })
+
+  it('leaves a correctly-adopted service alone (no DB write churn)', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map([[8080, [46947]]]))
+
+    mockFindAll.mockResolvedValue([{ id: 'vllm-id', port: 8080, status: 'running', wsl: true, pid: 46947 }])
+    mockGetStatus.mockReturnValue({ status: 'running', adoption: 'wsl', pid: 46947 })
 
     await reconciler.tick()
 
     expect(mockAdoptExternal).not.toHaveBeenCalled()
-    expect(mockUpdate).toHaveBeenCalledWith('dead-svc', { status: 'stopped', pid: null })
+    expect(mockUpdate).not.toHaveBeenCalled()
+    expect(mockMarkUnhealthy).not.toHaveBeenCalled()
   })
 
-  it('does not late-adopt when WSL snapshot failed for a wsl service (avoids false stopped)', async () => {
+  it('does not touch a spawned service whose child is still alive (model loading grace)', async () => {
+    // User just clicked Start; cmd.exe is alive; vllm hasn't bound the port yet.
+    // The reconciler must not declare it stopped during this window.
     mockSnapshotWindows.mockResolvedValueOnce(new Map())
-    mockSnapshotWsl.mockResolvedValueOnce(null) // snapshot failed
+    mockSnapshotWsl.mockResolvedValueOnce(new Map())
 
-    const services = [{ id: 'vllm-id', port: 8080, status: 'running', wsl: true, name: 'vllm' }]
-    mockFindAll.mockResolvedValue(services)
+    mockFindAll.mockResolvedValue([{ id: 'svc-1', port: 8080, status: 'running', wsl: true }])
+    mockGetStatus.mockReturnValue({
+      status: 'running',
+      process: { exitCode: null, killed: false }, // alive
+      pid: 11111,
+    })
+
+    await reconciler.tick()
+
+    expect(mockMarkUnhealthy).not.toHaveBeenCalled()
+    expect(mockAdoptExternal).not.toHaveBeenCalled()
+    expect(mockUpdate).not.toHaveBeenCalled()
+  })
+})
+
+describe('Reconciler.tick — snapshot-failure resilience', () => {
+  it('skips a wsl service when wsl snapshot returns null (does NOT mark stopped)', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(null)
+
+    mockFindAll.mockResolvedValue([{ id: 'vllm-id', port: 8080, status: 'running', wsl: true }])
+    mockGetStatus.mockReturnValue({ status: 'running', adoption: 'wsl', pid: 46947 })
+
+    await reconciler.tick()
+
+    expect(mockMarkUnhealthy).not.toHaveBeenCalled()
+    expect(mockUpdate).not.toHaveBeenCalled()
+  })
+
+  it('skips a wsl-untracked service when wsl snapshot returns null', async () => {
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(null)
+
+    mockFindAll.mockResolvedValue([{ id: 'vllm-id', port: 8080, status: 'running', wsl: true }])
     mockGetStatus.mockReturnValue(undefined)
 
     await reconciler.tick()
 
     expect(mockAdoptExternal).not.toHaveBeenCalled()
     expect(mockUpdate).not.toHaveBeenCalled()
-  })
-
-  it('passes the pre-fetched maps to verifyHealthWithMaps', async () => {
-    const winMap = new Map([[8080, [5196]]])
-    const wslMap = new Map<number, number[]>()
-    mockSnapshotWindows.mockResolvedValue(winMap)
-    mockSnapshotWsl.mockResolvedValue(wslMap)
-
-    const services = [{ id: 'svc-1', port: 8080, status: 'running' }]
-    mockFindAll.mockResolvedValue(services)
-    mockGetStatus.mockReturnValue({ status: 'running' })
-    mockVerifyHealthWithMaps.mockReturnValue({ healthy: true })
-
-    await reconciler.tick()
-
-    expect(mockVerifyHealthWithMaps).toHaveBeenCalledWith('svc-1', 8080, winMap, wslMap)
   })
 })
 
