@@ -1,11 +1,25 @@
 import { processManager } from '@/lib/process-manager'
 import { serviceRepository } from '@/lib/repositories/serviceRepository'
+import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { snapshotWindowsListeners, snapshotWslListeners, isWslProxyPid } from '@/lib/util/portHelper'
 import { onShutdown } from '@/lib/lifecycle'
 
 const TICK_INTERVAL_MS = 10_000
 
 const globalForReconciler = globalThis as unknown as { reconcilerInstance: Reconciler | undefined }
+
+/**
+ * Orders services so active-profile autostart entries are reconciled first.
+ * Ensures port/PID claims go to the intended owner when two services share a port.
+ * @param services - all services from the DB
+ * @param activeProfileId - active profile id (undefined = no ranking)
+ */
+async function rankByAutostartPriority(services: any[], activeProfileId: string | undefined): Promise<any[]> {
+  if (!activeProfileId) return services
+  const autoStartEntries = await runProfileRepository.findAutoStartServices(activeProfileId)
+  const autostartIds = new Set(autoStartEntries.map((e: any) => e.serviceId))
+  return [...services].sort((a, b) => Number(autostartIds.has(b.id)) - Number(autostartIds.has(a.id)))
+}
 
 class Reconciler {
   private interval: ReturnType<typeof setInterval> | undefined
@@ -60,10 +74,18 @@ class Reconciler {
       ])
 
       const services = await serviceRepository.findAll()
+      const active = await runProfileRepository.findActive()
+      const ranked = await rankByAutostartPriority(services, active?.id)
 
-      for (const svc of services) {
+      // Per-tick claim tracking: prevents two services that share a port from
+      // both adopting the same PID. Autostart services rank first, so the
+      // intended owner wins. Matches the logic in init's adoptRunningServices.
+      const claimedPorts = new Set<number>()
+      const claimedPids = new Set<string>()
+
+      for (const svc of ranked) {
         if (!svc.port) continue // noPort services use log-freshness, handled at init
-        await this.reconcileFromOS(svc, winMap, wslMap)
+        await this.reconcileFromOS(svc, winMap, wslMap, claimedPorts, claimedPids)
       }
     } catch (err) {
       console.error('[reconciler] tick error:', err)
@@ -83,6 +105,8 @@ class Reconciler {
     svc: any,
     winMap: Map<number, number[]> | null,
     wslMap: Map<number, number[]> | null,
+    claimedPorts: Set<number>,
+    claimedPids: Set<string>,
   ): Promise<void> {
     const port = svc.port as number
     const isWsl = !!svc.wsl
@@ -90,12 +114,31 @@ class Reconciler {
 
     // Spawned-child grace: the child cmd.exe may still be loading the model
     // before binding the port. Its exit event will mark the service stopped
-    // when it dies — don't override that lifecycle here.
-    if (mem?.process && !mem.process.killed && mem.process.exitCode === null) return
+    // when it dies — don't override that lifecycle here. Reserve the port so
+    // a lower-priority service on the same port doesn't try to adopt it.
+    if (mem?.process && !mem.process.killed && mem.process.exitCode === null) {
+      claimedPorts.add(port)
+      if (mem.pid) claimedPids.add(`${mem.adoption ?? 'windows'}:${mem.pid}`)
+      return
+    }
 
     // Skip when the snapshot we'd need is unavailable; the next tick can decide.
     if (isWsl && wslMap === null) return
     if (!isWsl && winMap === null && wslMap === null) return
+
+    // Another service earlier in the ranked list already claimed this port —
+    // typically vllm and Llama.cpp sharing 8080 with only vllm in the active
+    // profile. Mark this one stopped instead of letting it adopt the same PID.
+    if (claimedPorts.has(port)) {
+      if (mem?.status === 'running') {
+        console.log(`[reconciler] "${svc.name}" — port ${port} already claimed by another service, marking stopped`)
+        processManager.markUnhealthy(svc.id, 'port-claimed-by-other-service')
+      }
+      if (svc.status === 'running') {
+        await serviceRepository.update(svc.id, { status: 'stopped', pid: null })
+      }
+      return
+    }
 
     const rawWinPid = winMap?.get(port)?.[0]
     const wslPid = wslMap?.get(port)?.[0]
@@ -110,9 +153,26 @@ class Reconciler {
         : null
 
     if (candidate) {
+      const key = `${candidate.kind}:${candidate.pid}`
+      // PID-level claim: a PID can only belong to one service per tick. Prevents
+      // both vllm and Llama.cpp adopting the same WSL PID when they share port.
+      if (claimedPids.has(key)) {
+        if (mem?.status === 'running') {
+          console.log(`[reconciler] "${svc.name}" — pid ${candidate.pid} already claimed by another service, marking stopped`)
+          processManager.markUnhealthy(svc.id, 'pid-claimed-by-other-service')
+        }
+        if (svc.status === 'running') {
+          await serviceRepository.update(svc.id, { status: 'stopped', pid: null })
+        }
+        return
+      }
+
       // Listener present — service IS running. Adopt (or re-adopt if the pid
       // changed via internal restart) so processManager + DB reflect reality.
       const memMatches = mem?.adoption && mem.pid === candidate.pid && mem.status === 'running'
+      claimedPorts.add(port)
+      claimedPids.add(key)
+
       if (memMatches) return
 
       console.log(`[reconciler] reconciling "${svc.name}" → running pid=${candidate.pid} kind=${candidate.kind} (was ${mem?.status ?? 'untracked'})`)

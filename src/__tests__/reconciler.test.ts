@@ -33,6 +33,16 @@ jest.mock('@/lib/repositories/serviceRepository', () => ({
   },
 }))
 
+const mockFindActiveProfile = jest.fn(async () => null as any)
+const mockFindAutoStart = jest.fn(async () => [] as any[])
+
+jest.mock('@/lib/repositories/runProfileRepository', () => ({
+  runProfileRepository: {
+    findActive: mockFindActiveProfile,
+    findAutoStartServices: mockFindAutoStart,
+  },
+}))
+
 const mockSnapshotWindows = jest.fn(async () => new Map<number, number[]>() as Map<number, number[]> | null)
 const mockSnapshotWsl = jest.fn(async () => new Map<number, number[]>() as Map<number, number[]> | null)
 const mockIsWslProxyPid = jest.fn(async () => false)
@@ -204,6 +214,58 @@ describe('Reconciler.tick — OS as source of truth', () => {
     expect(mockMarkUnhealthy).not.toHaveBeenCalled()
     expect(mockAdoptExternal).not.toHaveBeenCalled()
     expect(mockUpdate).not.toHaveBeenCalled()
+  })
+})
+
+describe('Reconciler.tick — port/PID claim tracking across services', () => {
+  it('does not adopt a second service with the same PID when both share a port (autostart owner wins)', async () => {
+    // vllm + Llama.cpp both configured for port 8080; only vllm is in autostart.
+    // Without claim tracking the reconciler used to adopt the WSL pid for BOTH,
+    // so stopping Llama.cpp via the UI would kill vllm. Autostart ranking must
+    // route the claim to vllm; Llama.cpp must remain stopped.
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map([[8080, [406576]]]))
+
+    mockFindAll.mockResolvedValue([
+      { id: 'llama-id', port: 8080, status: 'stopped', wsl: true, name: 'Llama.cpp' },
+      { id: 'vllm-id', port: 8080, status: 'running', wsl: true, name: 'vllm' },
+    ])
+    mockFindActiveProfile.mockResolvedValueOnce({ id: 'p1' })
+    mockFindAutoStart.mockResolvedValueOnce([{ serviceId: 'vllm-id' }])
+    mockGetStatus.mockReturnValue(undefined)
+
+    await reconciler.tick()
+
+    expect(mockAdoptExternal).toHaveBeenCalledTimes(1)
+    expect(mockAdoptExternal).toHaveBeenCalledWith('vllm-id', 406576, 'wsl')
+    // Llama.cpp must not have been adopted with vllm's PID
+    expect(mockAdoptExternal).not.toHaveBeenCalledWith('llama-id', 406576, 'wsl')
+  })
+
+  it('does not clobber an already-adopted service when a lower-priority service shares its port', async () => {
+    // vllm is correctly adopted (memMatches=true → skip). Llama.cpp shares port
+    // but must NOT inherit vllm's PID just because vllm's branch returned early.
+    mockSnapshotWindows.mockResolvedValueOnce(new Map())
+    mockSnapshotWsl.mockResolvedValueOnce(new Map([[8080, [406576]]]))
+
+    mockFindAll.mockResolvedValue([
+      { id: 'vllm-id', port: 8080, status: 'running', wsl: true, pid: 406576, name: 'vllm' },
+      { id: 'llama-id', port: 8080, status: 'stopped', wsl: true, name: 'Llama.cpp' },
+    ])
+    mockFindActiveProfile.mockResolvedValueOnce({ id: 'p1' })
+    mockFindAutoStart.mockResolvedValueOnce([{ serviceId: 'vllm-id' }])
+    mockGetStatus.mockImplementation((id: string) =>
+      id === 'vllm-id'
+        ? { status: 'running', adoption: 'wsl', pid: 406576 }
+        : undefined
+    )
+
+    await reconciler.tick()
+
+    // vllm is already correct — no adopt call (memMatches short-circuits)
+    expect(mockAdoptExternal).not.toHaveBeenCalled()
+    // Llama.cpp must NOT have been adopted with the same PID
+    expect(mockUpdate).not.toHaveBeenCalledWith('llama-id', expect.objectContaining({ status: 'running' }))
   })
 })
 

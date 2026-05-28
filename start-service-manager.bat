@@ -7,8 +7,8 @@ cd C:\jason\dev\service-manager
 echo Starting Service Manager...
 echo.
 
-:: Start Next.js in production mode
-start /b cmd /c "npm run dev"
+:: Start Next.js in production mode (port 4000)
+start /b cmd /c "npm start"
 
 :: Wait for the server to be ready
 echo Waiting for server to start...

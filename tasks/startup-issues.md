@@ -8,4 +8,4 @@ Also, there are times when I edit a service, power on a service, and the entire 
 We only want to see ui updates for things that were impacted by the change.
 
 Investigate the issue by testing to recreate the issues first, then fix, then confirm.
-Feel free to start/stop any services.
+Feel free to start/stop any service
