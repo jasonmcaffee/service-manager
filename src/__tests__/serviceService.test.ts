@@ -67,10 +67,14 @@ jest.mock('@/lib/util/batchWriter', () => ({
   writeStartupScript: jest.fn(() => ({ scriptFile: '/tmp/service-manager/service-test.bat', logFile: '/tmp/service-manager/logs/service-test.log' })),
 }))
 
-// Mock init so initializeIfNeeded is a no-op in these unit tests
+// Mock init so initializeIfNeeded is a no-op in these unit tests. runAutoStart
+// now delegates the actual start loop to init.startAutoStartServices, so we mock
+// that too and assert delegation here; the loop itself is covered in init.test.ts.
+const mockStartAutoStartServices = jest.fn(async () => [] as any[])
 jest.mock('@/lib/services/init', () => ({
   initializeIfNeeded: jest.fn(async () => {}),
   ensureDefaultProfile: jest.fn(async () => {}),
+  startAutoStartServices: mockStartAutoStartServices,
 }))
 
 beforeEach(() => {
@@ -100,11 +104,9 @@ const makeService = (overrides = {}) => ({
 })
 
 describe('serviceService.runAutoStart', () => {
-  it('starts auto-start services on first call', async () => {
-    const svc = makeService()
-    mockRepo.findAll.mockResolvedValue([svc])
-    mockProfileRepo.findAutoStartServices.mockResolvedValue([
-      { service: svc, cudaDevice: null, startOnBoot: true }
+  it('delegates to startAutoStartServices on first call', async () => {
+    mockStartAutoStartServices.mockResolvedValue([
+      { id: 'svc-1', name: 'Test Service', status: 'started' },
     ])
 
     const result = await serviceService.runAutoStart()
@@ -113,7 +115,7 @@ describe('serviceService.runAutoStart', () => {
     expect(result.results).toHaveLength(1)
     expect(result.results[0].status).toBe('started')
     expect(mockProcessManager.markBootStarted).toHaveBeenCalledTimes(1)
-    expect(mockProcessManager.startService).toHaveBeenCalledTimes(1)
+    expect(mockStartAutoStartServices).toHaveBeenCalledTimes(1)
   })
 
   it('skips starting on subsequent calls (boot guard)', async () => {
@@ -123,20 +125,17 @@ describe('serviceService.runAutoStart', () => {
 
     expect(result.alreadyStarted).toBe(true)
     expect(result.results).toHaveLength(0)
-    expect(mockProcessManager.startService).not.toHaveBeenCalled()
+    expect(mockStartAutoStartServices).not.toHaveBeenCalled()
   })
 
-  it('skips services already running (adoption short-circuits spawn)', async () => {
-    const svc = makeService()
-    mockProfileRepo.findAutoStartServices.mockResolvedValue([
-      { service: svc, cudaDevice: null, startOnBoot: true }
+  it('surfaces already_running results from the delegate', async () => {
+    mockStartAutoStartServices.mockResolvedValue([
+      { id: 'svc-1', name: 'Test Service', status: 'already_running' },
     ])
-    mockProcessManager.isRunning.mockReturnValue(true)
 
     const result = await serviceService.runAutoStart()
 
     expect(result.results[0].status).toBe('already_running')
-    expect(mockProcessManager.startService).not.toHaveBeenCalled()
   })
 })
 

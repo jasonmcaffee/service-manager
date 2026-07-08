@@ -12,6 +12,10 @@ jest.mock('@/lib/process-manager', () => ({
   processManager: {
     isRunning: mockIsRunning,
     adoptExternal: mockAdoptExternal,
+    // initializeIfNeeded now runs boot autostart guarded by these; return true so
+    // these adoption-focused tests skip the autostart step entirely.
+    hasBootStarted: jest.fn(() => true),
+    markBootStarted: jest.fn(),
   },
 }))
 

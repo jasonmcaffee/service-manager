@@ -1,7 +1,17 @@
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
-import { getLogFilePath } from '@/lib/util/logTailer'
+import { getLogFilePath, MAX_LOG_BYTES } from '@/lib/util/logTailer'
+
+/**
+ * Resolves the absolute path to log-cap-writer.cjs, or null if it can't be found.
+ * The writer enforces the on-disk log size cap; when unavailable callers fall
+ * back to a plain shell redirect so a missing script never breaks service start.
+ */
+function resolveLogCapWriter(): string | null {
+  const candidate = path.join(process.cwd(), 'scripts', 'log-cap-writer.cjs')
+  return fs.existsSync(candidate) ? candidate : null
+}
 
 /**
  * Returns true if the command is a PowerShell script (not a batch script that
@@ -54,8 +64,14 @@ function writePowerShellScript(tempDir: string, serviceId: string, command: stri
     .join('\r\n')
   const logPathEscaped = logFile.replace(/'/g, "''")
   const truncate = `$null | Set-Content -Path '${logPathEscaped}'`
-  // Wrap all command lines in & { } so every line's output is redirected to the log
-  const commandBlock = `& {\r\n${command}\r\n} *>> '${logPathEscaped}'`
+  // Wrap all command lines in & { } so every line's output is captured. When the
+  // log-cap-writer is available, pipe the merged streams through it so the on-disk
+  // log is trimmed to MAX_LOG_BYTES; otherwise fall back to a plain append redirect.
+  const writer = resolveLogCapWriter()
+  const nodeExe = process.execPath.replace(/'/g, "''")
+  const commandBlock = writer
+    ? `& {\r\n${command}\r\n} *>&1 | & '${nodeExe}' '${writer.replace(/'/g, "''")}' '${logPathEscaped}' ${MAX_LOG_BYTES}`
+    : `& {\r\n${command}\r\n} *>> '${logPathEscaped}'`
   const parts = [envLines, truncate, commandBlock].filter(Boolean)
   const content = parts.join('\r\n')
   fs.writeFileSync(ps1File, content, 'utf-8')
@@ -85,8 +101,13 @@ function writeBatchScript(tempDir: string, serviceId: string, command: string, e
     .map(([key, value]) => `set ${key}=${value}`)
     .join('\r\n')
   const truncate = `type nul > "${logFile}"`
-  // call shares the env scope so PORT/CUDA_DEVICE are visible inside the inner bat
-  const callInner = `call "${innerBat}" >> "${logFile}" 2>&1`
+  // call shares the env scope so PORT/CUDA_DEVICE are visible inside the inner bat.
+  // When the log-cap-writer is available, pipe combined output through it so the
+  // on-disk log is trimmed to MAX_LOG_BYTES; otherwise fall back to a plain append.
+  const writer = resolveLogCapWriter()
+  const callInner = writer
+    ? `call "${innerBat}" 2>&1 | "${process.execPath}" "${writer}" "${logFile}" ${MAX_LOG_BYTES}`
+    : `call "${innerBat}" >> "${logFile}" 2>&1`
   const parts = ['@echo off', envLines, truncate, callInner].filter(Boolean)
   const content = parts.join('\r\n')
   fs.writeFileSync(outerBat, content, 'utf-8')

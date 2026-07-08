@@ -1,8 +1,11 @@
 import fs from 'fs'
-import { processManager } from '@/lib/process-manager'
+import { processManager, ServiceStatus } from '@/lib/process-manager'
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { serviceRepository } from '@/lib/repositories/serviceRepository'
-import { snapshotWindowsListeners, snapshotWslListeners, isWslProxyPid } from '@/lib/util/portHelper'
+import {
+  snapshotWindowsListeners, snapshotWslListeners, isWslProxyPid,
+  killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy,
+} from '@/lib/util/portHelper'
 import { getLogFilePath } from '@/lib/util/logTailer'
 import { reconciler } from '@/lib/services/reconciler'
 
@@ -202,9 +205,91 @@ async function adoptNoPortServices(): Promise<void> {
   }
 }
 
+export interface AutoStartResult {
+  id: string
+  name: string
+  status: 'started' | 'already_running' | 'error'
+  error?: string
+}
+
+/**
+ * Builds a state-change callback that persists a service's status/pid to the DB
+ * as the process manager transitions it through starting/running/stopped.
+ * @param id - service id whose row is updated
+ */
+function makeOnStateChange(id: string) {
+  return async (status: ServiceStatus, pid?: number) => {
+    await serviceRepository.update(id, { status, pid: pid ?? null })
+  }
+}
+
+/**
+ * Starts a single start-on-boot service unless it is already running/adopted.
+ * Mirrors the manual-start path: frees the port, spawns via the process manager,
+ * and (for WSL services) re-establishes the Windows port proxy. Skipping already
+ * running services keeps this idempotent so a service adopted at boot is never
+ * double-started.
+ * @param entry - RunProfileService row joined with its service and cudaDevice
+ */
+async function startOneAutoStartService(entry: any): Promise<AutoStartResult> {
+  const service = entry.service
+  if (processManager.isRunning(service.id)) {
+    console.log(`[init] autostart skip "${service.name}" — already running/adopted`)
+    return { id: service.id, name: service.name, status: 'already_running' }
+  }
+  try {
+    const env: Record<string, string> = {}
+    if (service.port) env.PORT = String(service.port)
+    if (entry.cudaDevice) env.CUDA_DEVICE = entry.cudaDevice
+    if (service.port) {
+      if (!service.wsl) {
+        const dir = extractServiceDir(service.command)
+        if (dir) await killMatchingProcesses(dir, 'node_modules')
+      }
+      await killPort(service.port)
+    }
+    console.log(`[init] autostart starting "${service.name}"`)
+    await processManager.startService(service.id, service.command, env, makeOnStateChange(service.id))
+    if (service.wsl && service.port) await ensureWslPortProxy(service.port)
+    return { id: service.id, name: service.name, status: 'started' }
+  } catch (error: any) {
+    console.error(`[init] autostart error "${service.name}": ${error.message}`)
+    return { id: service.id, name: service.name, status: 'error', error: error.message }
+  }
+}
+
+/**
+ * Starts every start-on-boot service in the active profile that is not already
+ * running or adopted. This is the server-side autostart that runs when the
+ * manager process boots, so flagged services launch even when no browser ever
+ * opens the UI. Idempotent — running/adopted services are skipped so nothing
+ * listening on its port is double-started. Entries are processed sequentially
+ * with a brief settle delay after each real spawn.
+ */
+export async function startAutoStartServices(): Promise<AutoStartResult[]> {
+  const active = await runProfileRepository.findActive()
+  if (!active) {
+    console.log('[init] autostart: no active profile — nothing to start')
+    return []
+  }
+  const entries = await runProfileRepository.findAutoStartServices(active.id)
+  const results: AutoStartResult[] = []
+  for (const entry of entries) {
+    const result = await startOneAutoStartService(entry)
+    results.push(result)
+    if (result.status === 'started') await new Promise(r => setTimeout(r, 1000))
+  }
+  const started = results.filter(r => r.status === 'started').length
+  const running = results.filter(r => r.status === 'already_running').length
+  const errored = results.filter(r => r.status === 'error').length
+  console.log(`[init] autostart complete: ${started} started, ${running} already running, ${errored} errored`)
+  return results
+}
+
 /**
  * Single-flight initialization: backfills ports, ensures a default profile exists,
- * adopts already-running services, and starts the reconciler.
+ * adopts already-running services, starts any start-on-boot service that adoption
+ * didn't already pick up, then starts the reconciler.
  * Safe to call concurrently — all callers share the same Promise.
  */
 export function initializeIfNeeded(): Promise<void> {
@@ -214,6 +299,13 @@ export function initializeIfNeeded(): Promise<void> {
       await ensureDefaultProfile()
       await adoptRunningServices()
       await adoptNoPortServices()
+      // Launch flagged-but-stopped services. The boot guard is shared (via the
+      // process manager on globalThis) with the HTTP /startup path, so whichever
+      // trigger fires first wins and services are never double-started.
+      if (!processManager.hasBootStarted()) {
+        processManager.markBootStarted()
+        await startAutoStartServices()
+      }
       reconciler.start()
     })()
   }

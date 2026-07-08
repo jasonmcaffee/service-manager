@@ -5,10 +5,35 @@ import os from 'os'
 const MAX_LINES = 1000
 const POLL_INTERVAL_MS = 150
 
+// Hard cap for on-disk service logs. A runaway log (e.g. a chatty proxy under a
+// bot-scan flood) must never exceed this — reading a file larger than Node's max
+// string length (~512MB) throws and previously 500'd the entire /api/services
+// endpoint, blanking the UI. See log-cap-writer.cjs for the write-side enforcement.
+export const MAX_LOG_BYTES = 20 * 1024 * 1024
+
 export function getLogFilePath(serviceId: string): string {
   const logsDir = path.join(os.tmpdir(), 'service-manager', 'logs')
   fs.mkdirSync(logsDir, { recursive: true })
   return path.join(logsDir, `service-${serviceId}.log`)
+}
+
+/**
+ * Reads a log file as a string while never loading more than MAX_LOG_BYTES.
+ * When the file is larger than the cap, only its most-recent MAX_LOG_BYTES are
+ * returned so a giant file can never exceed Node's max string length and crash.
+ * @param logFile - absolute path to the log file
+ */
+export function readLogFileCapped(logFile: string): string {
+  const size = fs.statSync(logFile).size
+  if (size <= MAX_LOG_BYTES) return fs.readFileSync(logFile, 'utf-8')
+  const buf = Buffer.alloc(MAX_LOG_BYTES)
+  const fd = fs.openSync(logFile, 'r')
+  try {
+    fs.readSync(fd, buf, 0, MAX_LOG_BYTES, size - MAX_LOG_BYTES)
+  } finally {
+    fs.closeSync(fd)
+  }
+  return buf.toString('utf-8')
 }
 
 interface TailerEntry {
@@ -53,10 +78,13 @@ class LogTailer {
 
     if (fs.existsSync(logFile)) {
       if (fromStart) {
-        const content = fs.readFileSync(logFile, 'utf-8')
+        const content = readLogFileCapped(logFile)
         const lines = content.split('\n').filter(l => l.length > 0)
         buffer.push(...lines.slice(-MAX_LINES))
-        offset = Buffer.byteLength(content, 'utf-8')
+        // Seek to true EOF, not content byte-length: when the file exceeds the
+        // cap we only loaded its tail, so the skipped head must not be re-read
+        // by the poll loop (which would rebuild the same oversized string).
+        offset = fs.statSync(logFile).size
       } else {
         offset = fs.statSync(logFile).size
       }

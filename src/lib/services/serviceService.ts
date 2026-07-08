@@ -2,9 +2,9 @@ import fs from 'fs'
 import { processManager, ServiceStatus } from '@/lib/process-manager'
 import { serviceRepository, CreateServiceInput, UpdateServiceInput } from '@/lib/repositories/serviceRepository'
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
-import { initializeIfNeeded } from '@/lib/services/init'
+import { initializeIfNeeded, startAutoStartServices } from '@/lib/services/init'
 import { killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy } from '@/lib/util/portHelper'
-import { getLogFilePath } from '@/lib/util/logTailer'
+import { getLogFilePath, readLogFileCapped } from '@/lib/util/logTailer'
 
 /**
  * Reads the log file for a service and returns its lines, or empty array if unavailable.
@@ -14,7 +14,7 @@ function readLogFileLines(id: string): string[] {
   try {
     const logFile = getLogFilePath(id)
     if (!fs.existsSync(logFile)) return []
-    return fs.readFileSync(logFile, 'utf-8').split('\n')
+    return readLogFileCapped(logFile).split('\n')
   } catch {
     return []
   }
@@ -264,6 +264,12 @@ export const serviceService = {
     }
   },
 
+  /**
+   * HTTP entry point for triggering start-on-boot services (POST /api/services/startup).
+   * Delegates to the shared server-side autostart in init so there is a single
+   * source of truth. The boot guard is shared with init's own boot-time autostart,
+   * so whichever path fires first wins and services are never double-started.
+   */
   async runAutoStart() {
     await initializeIfNeeded()
 
@@ -272,46 +278,7 @@ export const serviceService = {
     }
     processManager.markBootStarted()
 
-    const active = await runProfileRepository.findActive()
-    if (!active) return { alreadyStarted: false, results: [] }
-
-    const autoStartEntries = await runProfileRepository.findAutoStartServices(active.id)
-    const results: Array<{ id: string; name: string; status: string; error?: string }> = []
-
-    for (const entry of autoStartEntries) {
-      const service = entry.service
-      if (processManager.isRunning(service.id)) {
-        results.push({ id: service.id, name: service.name, status: 'already_running' })
-        continue
-      }
-
-      try {
-        const env: Record<string, string> = {}
-        if (service.port) env.PORT = String(service.port)
-        if (entry.cudaDevice) env.CUDA_DEVICE = entry.cudaDevice
-
-        if (service.port) {
-          if (!(service as any).wsl) {
-            const serviceDir = extractServiceDir(service.command)
-            if (serviceDir) await killMatchingProcesses(serviceDir, 'node_modules')
-          }
-          await killPort(service.port)
-        }
-
-        await processManager.startService(
-          service.id,
-          service.command,
-          env,
-          makeOnStateChange(service.id)
-        )
-        if ((service as any).wsl && service.port) await ensureWslPortProxy(service.port)
-        results.push({ id: service.id, name: service.name, status: 'started' })
-        await new Promise(resolve => setTimeout(resolve, 1000))
-      } catch (error: any) {
-        results.push({ id: service.id, name: service.name, status: 'error', error: error.message })
-      }
-    }
-
+    const results = await startAutoStartServices()
     return { alreadyStarted: false, results }
   },
 

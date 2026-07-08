@@ -4,6 +4,13 @@ import { promisify } from 'util'
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
 
+// Hard ceiling for any OS-probe shell-out (netstat / wsl / tasklist). Without a
+// timeout a single hung `wsl` or `tasklist` invocation (e.g. WSL cold/unresponsive)
+// blocks the single-flight init Promise forever, wedging /api/services and the
+// whole UI. On timeout the child is killed and the call rejects, which every
+// caller already degrades gracefully (snapshot → null, process name → '').
+const PROBE_TIMEOUT_MS = 8000
+
 // Windows system processes used as WSL port-forwarding proxies — never the
 // actual service, so we skip them during adoption to prevent false positives.
 const WSL_PROXY_PROCESS_NAMES = new Set(['svchost', 'system'])
@@ -15,7 +22,7 @@ const WSL_PROXY_PROCESS_NAMES = new Set(['svchost', 'system'])
  */
 export async function getWindowsProcessName(pid: number): Promise<string> {
   const { stdout } = await execAsync(
-    `tasklist /fi "PID eq ${pid}" /fo csv /nh`
+    `tasklist /fi "PID eq ${pid}" /fo csv /nh`, { timeout: PROBE_TIMEOUT_MS }
   ).catch(() => ({ stdout: '' }))
   const match = stdout.match(/"([^"]+\.exe)"/)
   return match ? match[1].replace(/\.exe$/i, '').toLowerCase() : ''
@@ -37,7 +44,7 @@ export async function isWslProxyPid(pid: number): Promise<boolean> {
  */
 export async function getWindowsPidsOnPort(port: number): Promise<number[]> {
   const { stdout } = await execAsync(
-    `netstat -ano | findstr ":${port}" | findstr "LISTENING"`
+    `netstat -ano | findstr ":${port}" | findstr "LISTENING"`, { timeout: PROBE_TIMEOUT_MS }
   ).catch(() => ({ stdout: '' }))
 
   if (!stdout.trim()) return []
@@ -59,8 +66,8 @@ export async function getWindowsPidsOnPort(port: number): Promise<number[]> {
  */
 export async function getWslPidsOnPort(port: number): Promise<number[]> {
   const [ssOut, fuserOut] = await Promise.all([
-    execFileAsync('wsl', ['-e', 'bash', '-c', 'ss -tlnp']).catch(() => ({ stdout: '' })),
-    execFileAsync('wsl', ['-e', 'bash', '-c', `fuser ${port}/tcp 2>/dev/null || true`]).catch(() => ({ stdout: '' })),
+    execFileAsync('wsl', ['-e', 'bash', '-c', 'ss -tlnp'], { timeout: PROBE_TIMEOUT_MS }).catch(() => ({ stdout: '' })),
+    execFileAsync('wsl', ['-e', 'bash', '-c', `fuser ${port}/tcp 2>/dev/null || true`], { timeout: PROBE_TIMEOUT_MS }).catch(() => ({ stdout: '' })),
   ])
 
   const ssPids = ssOut.stdout.split('\n')
@@ -82,7 +89,7 @@ export async function getWslPidsOnPort(port: number): Promise<number[]> {
 export async function snapshotWindowsListeners(): Promise<Map<number, number[]> | null> {
   let stdout: string
   try {
-    const res = await execAsync('netstat -ano')
+    const res = await execAsync('netstat -ano', { timeout: PROBE_TIMEOUT_MS })
     stdout = res.stdout
   } catch (err: any) {
     console.warn('[portHelper] snapshotWindowsListeners failed:', err.message)
@@ -119,7 +126,7 @@ export async function snapshotWindowsListeners(): Promise<Map<number, number[]> 
 export async function snapshotWslListeners(): Promise<Map<number, number[]> | null> {
   let stdout: string
   try {
-    const res = await execFileAsync('wsl', ['-e', 'bash', '-c', 'ss -tlnp 2>/dev/null'])
+    const res = await execFileAsync('wsl', ['-e', 'bash', '-c', 'ss -tlnp 2>/dev/null'], { timeout: PROBE_TIMEOUT_MS })
     stdout = res.stdout
   } catch (err: any) {
     console.warn('[portHelper] snapshotWslListeners failed:', err.message)
