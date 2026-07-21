@@ -11,6 +11,12 @@ const POLL_INTERVAL_MS = 150
 // endpoint, blanking the UI. See log-cap-writer.cjs for the write-side enforcement.
 export const MAX_LOG_BYTES = 20 * 1024 * 1024
 
+// Only this much of an existing log is read when a tailer starts. The buffer keeps
+// MAX_LINES (1000) lines, so pulling the whole 20 MB cap into a string on every
+// (re-)adoption was pure waste — and on a pre-cap oversized file it threw
+// ERR_STRING_TOO_LONG, which aborted the entire reconciler tick (task-609).
+export const INITIAL_TAIL_BYTES = 512 * 1024
+
 export function getLogFilePath(serviceId: string): string {
   const logsDir = path.join(os.tmpdir(), 'service-manager', 'logs')
   fs.mkdirSync(logsDir, { recursive: true })
@@ -22,14 +28,15 @@ export function getLogFilePath(serviceId: string): string {
  * When the file is larger than the cap, only its most-recent MAX_LOG_BYTES are
  * returned so a giant file can never exceed Node's max string length and crash.
  * @param logFile - absolute path to the log file
+ * @param maxBytes - most-recent bytes to read (defaults to the on-disk cap)
  */
-export function readLogFileCapped(logFile: string): string {
+export function readLogFileCapped(logFile: string, maxBytes: number = MAX_LOG_BYTES): string {
   const size = fs.statSync(logFile).size
-  if (size <= MAX_LOG_BYTES) return fs.readFileSync(logFile, 'utf-8')
-  const buf = Buffer.alloc(MAX_LOG_BYTES)
+  if (size <= maxBytes) return fs.readFileSync(logFile, 'utf-8')
+  const buf = Buffer.alloc(maxBytes)
   const fd = fs.openSync(logFile, 'r')
   try {
-    fs.readSync(fd, buf, 0, MAX_LOG_BYTES, size - MAX_LOG_BYTES)
+    fs.readSync(fd, buf, 0, maxBytes, size - maxBytes)
   } finally {
     fs.closeSync(fd)
   }
@@ -78,7 +85,7 @@ class LogTailer {
 
     if (fs.existsSync(logFile)) {
       if (fromStart) {
-        const content = readLogFileCapped(logFile)
+        const content = readLogFileCapped(logFile, INITIAL_TAIL_BYTES)
         const lines = content.split('\n').filter(l => l.length > 0)
         buffer.push(...lines.slice(-MAX_LINES))
         // Seek to true EOF, not content byte-length: when the file exceeds the

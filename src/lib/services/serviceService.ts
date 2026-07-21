@@ -4,17 +4,19 @@ import { serviceRepository, CreateServiceInput, UpdateServiceInput } from '@/lib
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { initializeIfNeeded, startAutoStartServices } from '@/lib/services/init'
 import { killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy } from '@/lib/util/portHelper'
-import { getLogFilePath, readLogFileCapped } from '@/lib/util/logTailer'
+import { getLogFilePath, readLogFileCapped, INITIAL_TAIL_BYTES } from '@/lib/util/logTailer'
 
 /**
- * Reads the log file for a service and returns its lines, or empty array if unavailable.
+ * Reads the tail of a service's log file and returns its lines, or an empty array
+ * if unavailable. Bounded to INITIAL_TAIL_BYTES because this runs on the 1s UI
+ * output poll for every service without a live tailer.
  * @param id - service identifier used to locate the log file
  */
 function readLogFileLines(id: string): string[] {
   try {
     const logFile = getLogFilePath(id)
     if (!fs.existsSync(logFile)) return []
-    return readLogFileCapped(logFile).split('\n')
+    return readLogFileCapped(logFile, INITIAL_TAIL_BYTES).split('\n')
   } catch {
     return []
   }
@@ -37,6 +39,26 @@ async function buildEnvForService(serviceId: string, port: number | null | undef
   return env
 }
 
+
+/**
+ * Frees a service's port before (re)starting it, scoped so the kill can only ever
+ * touch that service. The owning service id lets the guard keep every other
+ * service's PIDs — and the claude/opencode terminal daemons — off the kill list,
+ * and only PIDs Service Manager spawned for this service may be tree-killed.
+ * No-op for services without a port.
+ * @param service - the service row being started or restarted
+ */
+async function freePortForService(service: any): Promise<void> {
+  if (!service.port) return
+  if (!service.wsl) {
+    const serviceDir = extractServiceDir(service.command)
+    if (serviceDir) await killMatchingProcesses(serviceDir, 'node_modules', service.id)
+  }
+  await killPort(service.port, {
+    ownerServiceId: service.id,
+    spawnedPids: processManager.getSpawnedPids(service.id),
+  })
+}
 
 function validatePort(port: number | null | undefined) {
   if (port === undefined || port === null) return
@@ -183,13 +205,7 @@ export const serviceService = {
       throw err
     }
 
-    if (service.port) {
-      if (!(service as any).wsl) {
-        const serviceDir = extractServiceDir(service.command)
-        if (serviceDir) await killMatchingProcesses(serviceDir, 'node_modules')
-      }
-      await killPort(service.port)
-    }
+    await freePortForService(service)
 
     const env = await buildEnvForService(id, service.port)
     await processManager.startService(service.id, service.command, env, makeOnStateChange(id))
@@ -216,13 +232,15 @@ export const serviceService = {
     const onStateChange = makeOnStateChange(id)
     await processManager.stopService(id, onStateChange)
 
+    const killOpts = { ownerServiceId: id, spawnedPids: processManager.getSpawnedPids(id) }
+
     if (processManager.isRunning(id) && service.port) {
-      await killPort(service.port)
+      await killPort(service.port, killOpts)
       await onStateChange('stopped', undefined)
     }
 
     if ((service as any).wsl && service.port) {
-      await killPort(service.port)
+      await killPort(service.port, killOpts)
     }
 
     const mem = processManager.getStatus(id)
@@ -242,13 +260,7 @@ export const serviceService = {
       throw err
     }
 
-    if (service.port) {
-      if (!(service as any).wsl) {
-        const serviceDir = extractServiceDir(service.command)
-        if (serviceDir) await killMatchingProcesses(serviceDir, 'node_modules')
-      }
-      await killPort(service.port)
-    }
+    await freePortForService(service)
 
     const env = await buildEnvForService(id, service.port)
     await processManager.restartService(service.id, service.command, env, makeOnStateChange(id))

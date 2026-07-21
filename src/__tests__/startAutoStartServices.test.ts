@@ -14,6 +14,8 @@ jest.mock('@/lib/process-manager', () => ({
   processManager: {
     isRunning: mockIsRunning,
     startService: mockStartService,
+    getSpawnedPids: jest.fn((_id: string) => [] as number[]),
+    getTrackedPidsByService: jest.fn(() => new Map()),
     // used by initializeIfNeeded's boot guard (not exercised in these tests)
     hasBootStarted: jest.fn(() => false),
     markBootStarted: jest.fn(),
@@ -124,7 +126,7 @@ describe('startAutoStartServices', () => {
 
     await startAutoStartServices()
 
-    expect(mockKillPort).toHaveBeenCalledWith(8083)
+    expect(mockKillPort).toHaveBeenCalledWith(8083, expect.objectContaining({ ownerServiceId: expect.any(String) }))
   })
 
   it('passes PORT and CUDA_DEVICE env when configured', async () => {

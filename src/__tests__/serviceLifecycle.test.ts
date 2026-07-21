@@ -41,6 +41,8 @@ jest.mock('@/lib/process-manager', () => ({
     markBootStarted: mockMarkBootStarted,
     hasBootStarted: mockHasBootStarted,
     getPid: mockGetPid,
+    getSpawnedPids: jest.fn((_id: string) => [] as number[]),
+    getTrackedPidsByService: jest.fn(() => new Map<string, number[]>()),
   },
 }))
 
@@ -101,6 +103,11 @@ jest.mock('@/lib/services/init', () => ({
 
 jest.mock('@/lib/util/logTailer', () => ({
   getLogFilePath: jest.fn((id: string) => `/tmp/service-manager/logs/service-${id}.log`),
+  // Real implementations — serviceService reads the log tail through these, so
+  // stubbing them out silently broke the log-fallback path under test.
+  readLogFileCapped: jest.requireActual('@/lib/util/logTailer').readLogFileCapped,
+  INITIAL_TAIL_BYTES: jest.requireActual('@/lib/util/logTailer').INITIAL_TAIL_BYTES,
+  MAX_LOG_BYTES: jest.requireActual('@/lib/util/logTailer').MAX_LOG_BYTES,
   logTailer: { start: jest.fn(), stop: jest.fn(), getRecent: jest.fn(() => []), stopAll: jest.fn() },
 }))
 
@@ -192,7 +199,7 @@ describe('serviceService.startService', () => {
     await serviceService.startService('test-svc-id')
 
     expect(shutdownWsl).not.toHaveBeenCalled()
-    expect(killPort).toHaveBeenCalledWith(8080)
+    expect(killPort).toHaveBeenCalledWith(8080, expect.objectContaining({ ownerServiceId: 'test-svc-id' }))
   })
 
   it('kills matching watcher processes before starting a non-WSL service with a cd command', async () => {
@@ -205,8 +212,8 @@ describe('serviceService.startService', () => {
     await serviceService.startService('test-svc-id')
 
     expect(shutdownWsl).not.toHaveBeenCalled()
-    expect(killMatchingProcesses).toHaveBeenCalledWith('C:\\jason\\dev\\ai-proxy', 'node_modules')
-    expect(killPort).toHaveBeenCalledWith(4141)
+    expect(killMatchingProcesses).toHaveBeenCalledWith('C:\\jason\\dev\\ai-proxy', 'node_modules', 'test-svc-id')
+    expect(killPort).toHaveBeenCalledWith(4141, expect.objectContaining({ ownerServiceId: 'test-svc-id' }))
   })
 
   it('kills port before starting a WSL service without shutting down WSL', async () => {
@@ -219,7 +226,7 @@ describe('serviceService.startService', () => {
     await serviceService.startService('test-svc-id')
 
     expect(shutdownWsl).not.toHaveBeenCalled()
-    expect(killPort).toHaveBeenCalledWith(8080)
+    expect(killPort).toHaveBeenCalledWith(8080, expect.objectContaining({ ownerServiceId: 'test-svc-id' }))
   })
 })
 

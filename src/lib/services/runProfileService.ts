@@ -2,20 +2,9 @@ import { processManager } from '@/lib/process-manager'
 import { runProfileRepository, UpsertProfileServiceInput } from '@/lib/repositories/runProfileRepository'
 import { serviceRepository } from '@/lib/repositories/serviceRepository'
 import { initializeIfNeeded, ensureDefaultProfile } from '@/lib/services/init'
-import { diffProfiles, EffectiveConfig } from '@/lib/services/profileDiff'
-
-function buildEnv(port: number | null | undefined, cudaDevice: string | null | undefined): Record<string, string> {
-  const env: Record<string, string> = {}
-  if (port) env.PORT = String(port)
-  if (cudaDevice) env.CUDA_DEVICE = cudaDevice
-  return env
-}
-
-function makeOnStateChange(id: string) {
-  return async (status: import('@/lib/process-manager').ServiceStatus, pid?: number) => {
-    await serviceRepository.update(id, { status, pid: pid ?? null })
-  }
-}
+import { serviceService } from '@/lib/services/serviceService'
+import { diffProfiles, EffectiveConfig, DiffAction } from '@/lib/services/profileDiff'
+import { isProtectedServiceName } from '@/lib/util/processGuard'
 
 /**
  * Builds an EffectiveConfig array for every service under the given profile.
@@ -38,6 +27,48 @@ async function buildEffectiveConfigs(profileId: string): Promise<EffectiveConfig
       startOnBoot: override?.startOnBoot ?? false,
     }
   })
+}
+
+/**
+ * Returns the ids of services a profile switch must never stop or restart —
+ * the claude/opencode terminal daemons that host the agent session driving
+ * Service Manager.
+ */
+async function buildProtectedServiceIds(): Promise<Set<string>> {
+  const services = await serviceRepository.findAll()
+  return new Set(services.filter(s => isProtectedServiceName(s.name)).map(s => s.id))
+}
+
+/**
+ * Applies one profile-switch action to a service through serviceService, so a
+ * switch gets exactly the same guarded treatment as a manual start/stop/restart
+ * (scoped port free, never-kill guard, WSL portproxy, DB state persistence).
+ * @param serviceId - the service to act on
+ * @param action - the diff action to apply ('start' | 'stop' | 'restart')
+ */
+async function applyProfileAction(serviceId: string, action: DiffAction): Promise<{ id: string; name: string; status: string; error?: string } | null> {
+  const service = await serviceRepository.findById(serviceId)
+  if (!service) return null
+
+  try {
+    if (action === 'stop') {
+      await serviceService.stopService(serviceId)
+      return { id: serviceId, name: service.name, status: 'stopped' }
+    }
+    if (action === 'start') {
+      await serviceService.startService(serviceId)
+      await new Promise(resolve => setTimeout(resolve, 500))
+      return { id: serviceId, name: service.name, status: 'started' }
+    }
+    if (action === 'restart') {
+      await serviceService.restartService(serviceId)
+      await new Promise(resolve => setTimeout(resolve, 500))
+      return { id: serviceId, name: service.name, status: 'restarted' }
+    }
+    return null
+  } catch (error: any) {
+    return { id: serviceId, name: service.name, status: 'error', error: error.message }
+  }
 }
 
 export { ensureDefaultProfile }
@@ -85,7 +116,12 @@ export const runProfileService = {
       buildEffectiveConfigs(id),
     ])
 
-    const actions = diffProfiles(prevConfigs, nextConfigs, sid => processManager.isRunning(sid))
+    const protectedIds = await buildProtectedServiceIds()
+    const actions = diffProfiles(
+      prevConfigs, nextConfigs,
+      sid => processManager.isRunning(sid),
+      sid => protectedIds.has(sid),
+    )
 
     // Switch the active profile before spawning so env vars resolve correctly
     const profile = await runProfileRepository.setActive(id)
@@ -94,30 +130,8 @@ export const runProfileService = {
 
     for (const [serviceId, action] of actions) {
       if (action === 'noop') continue
-
-      const nextCfg = nextConfigs.find(c => c.serviceId === serviceId)
-      const service = await serviceRepository.findById(serviceId)
-      if (!service) continue
-
-      const env = buildEnv(nextCfg?.port, nextCfg?.cudaDevice)
-      const onStateChange = makeOnStateChange(serviceId)
-
-      try {
-        if (action === 'stop') {
-          await processManager.stopService(serviceId, onStateChange)
-          results.push({ id: serviceId, name: service.name, status: 'stopped' })
-        } else if (action === 'start') {
-          await processManager.startService(serviceId, service.command, env, onStateChange)
-          results.push({ id: serviceId, name: service.name, status: 'started' })
-          await new Promise(resolve => setTimeout(resolve, 500))
-        } else if (action === 'restart') {
-          await processManager.restartService(serviceId, service.command, env, onStateChange)
-          results.push({ id: serviceId, name: service.name, status: 'restarted' })
-          await new Promise(resolve => setTimeout(resolve, 500))
-        }
-      } catch (error: any) {
-        results.push({ id: serviceId, name: service.name, status: 'error', error: error.message })
-      }
+      const result = await applyProfileAction(serviceId, action)
+      if (result) results.push(result)
     }
 
     return { profile, startedServices: results }

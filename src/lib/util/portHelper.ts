@@ -1,5 +1,16 @@
 import { exec, execFile } from 'child_process'
 import { promisify } from 'util'
+import {
+  parseNetstatListeners, snapshotProcessTable, buildProtectedPids, partitionKillablePids,
+  getTrackedPids, commandLineTargetsDir, ancestorsOf, ProcessTable,
+} from '@/lib/util/processGuard'
+
+export interface KillPortOptions {
+  /** Service whose port is being freed — its own tracked PIDs remain killable. */
+  ownerServiceId?: string
+  /** PIDs Service Manager spawned for that service; only these may be tree-killed. */
+  spawnedPids?: number[]
+}
 
 const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
@@ -10,6 +21,9 @@ const execFileAsync = promisify(execFile)
 // whole UI. On timeout the child is killed and the call rejects, which every
 // caller already degrades gracefully (snapshot → null, process name → '').
 const PROBE_TIMEOUT_MS = 8000
+
+// `netstat -ano` on a busy machine easily exceeds exec's default 1 MB buffer.
+const NETSTAT_MAX_BUFFER = 16 * 1024 * 1024
 
 // Windows system processes used as WSL port-forwarding proxies — never the
 // actual service, so we skip them during adoption to prevent false positives.
@@ -39,23 +53,22 @@ export async function isWslProxyPid(pid: number): Promise<boolean> {
 }
 
 /**
- * Finds PIDs of Windows processes listening on the given port via netstat.
+ * Finds PIDs of Windows processes listening on EXACTLY the given port.
+ *
+ * Deliberately does not use `findstr ":<port>"` — that is a substring match, so
+ * port 80 also matched 8080/8081/8091/8092 and every one of those PIDs was then
+ * force-tree-killed, taking down the claude terminal daemon and unrelated
+ * services (task-609). The netstat local-address column is parsed and the port
+ * compared numerically instead.
  * @param port - TCP port number to check
  */
 export async function getWindowsPidsOnPort(port: number): Promise<number[]> {
   const { stdout } = await execAsync(
-    `netstat -ano | findstr ":${port}" | findstr "LISTENING"`, { timeout: PROBE_TIMEOUT_MS }
+    'netstat -ano', { timeout: PROBE_TIMEOUT_MS, maxBuffer: NETSTAT_MAX_BUFFER }
   ).catch(() => ({ stdout: '' }))
 
   if (!stdout.trim()) return []
-
-  const pidSet = new Set<number>()
-  for (const line of stdout.trim().split('\n')) {
-    const parts = line.trim().split(/\s+/)
-    const pid = parseInt(parts[parts.length - 1])
-    if (!isNaN(pid)) pidSet.add(pid)
-  }
-  return Array.from(pidSet)
+  return parseNetstatListeners(stdout).get(port) ?? []
 }
 
 /**
@@ -89,31 +102,14 @@ export async function getWslPidsOnPort(port: number): Promise<number[]> {
 export async function snapshotWindowsListeners(): Promise<Map<number, number[]> | null> {
   let stdout: string
   try {
-    const res = await execAsync('netstat -ano', { timeout: PROBE_TIMEOUT_MS })
+    const res = await execAsync('netstat -ano', { timeout: PROBE_TIMEOUT_MS, maxBuffer: NETSTAT_MAX_BUFFER })
     stdout = res.stdout
   } catch (err: any) {
     console.warn('[portHelper] snapshotWindowsListeners failed:', err.message)
     return null
   }
 
-  const result = new Map<number, number[]>()
-  for (const line of stdout.split('\n')) {
-    if (!line.includes('LISTENING')) continue
-    const parts = line.trim().split(/\s+/)
-    // parts: [Proto, LocalAddress, ForeignAddress, State, PID]
-    if (parts.length < 5) continue
-    const localAddr = parts[1]
-    const pid = parseInt(parts[4])
-    if (isNaN(pid)) continue
-    const colonIdx = localAddr.lastIndexOf(':')
-    if (colonIdx === -1) continue
-    const port = parseInt(localAddr.slice(colonIdx + 1))
-    if (isNaN(port)) continue
-    const existing = result.get(port) ?? []
-    existing.push(pid)
-    result.set(port, existing)
-  }
-  return result
+  return parseNetstatListeners(stdout)
 }
 
 /**
@@ -150,14 +146,20 @@ export async function snapshotWslListeners(): Promise<Map<number, number[]> | nu
 }
 
 /**
- * Kills all Windows processes on the given port using taskkill.
+ * Kills the given Windows PIDs with taskkill.
+ *
+ * `/T` (kill the whole descendant tree) is applied ONLY to PIDs Service Manager
+ * itself spawned for this service — tree-killing a foreign/adopted PID is how a
+ * single over-broad match previously cascaded into unrelated process trees.
  * @param pids - Windows process IDs to kill
+ * @param treePids - subset of pids that Service Manager spawned and may tree-kill
  */
-async function killWindowsPids(pids: number[]): Promise<number[]> {
+async function killWindowsPids(pids: number[], treePids: Set<number> = new Set()): Promise<number[]> {
   const killed: number[] = []
   for (const pid of pids) {
+    const treeFlag = treePids.has(pid) ? ' /T' : ''
     try {
-      await execAsync(`taskkill /PID ${pid} /T /F`)
+      await execAsync(`taskkill /PID ${pid}${treeFlag} /F`)
       killed.push(pid)
     } catch (err: any) {
       if (!err.message?.includes('not found')) {
@@ -166,6 +168,35 @@ async function killWindowsPids(pids: number[]): Promise<number[]> {
     }
   }
   return killed
+}
+
+/**
+ * Builds the never-kill PID map for a kill operation against the live process table.
+ * Returns an empty map when the process-table probe fails, in which case only the
+ * static/self-pid protections apply.
+ * @param ownerServiceId - the service whose port is being freed (its own pids stay killable)
+ */
+async function resolveProtectedPids(ownerServiceId?: string): Promise<{ protectedPids: Map<number, string>; table: ProcessTable }> {
+  const table = await snapshotProcessTable()
+  const protectedPids = buildProtectedPids({
+    selfPid: process.pid,
+    table,
+    trackedPidsByServiceId: getTrackedPids(),
+    ownerServiceId,
+  })
+  return { protectedPids, table }
+}
+
+/**
+ * Logs every PID a kill operation refused to touch, so a port that stays occupied
+ * is diagnosable instead of silently failing.
+ * @param context - short description of the operation for the log line
+ * @param blocked - the protected PIDs with their reasons
+ */
+function logBlockedPids(context: string, blocked: Array<{ pid: number; reason: string }>): void {
+  for (const b of blocked) {
+    console.warn(`[portHelper] ${context}: refused to kill PID ${b.pid} — ${b.reason}`)
+  }
 }
 
 /**
@@ -307,18 +338,36 @@ export async function ensureWslPortProxy(port: number): Promise<void> {
  * Both are killed in parallel — necessary for WSL services where a Windows
  * svchost port-proxy sits on the same port as the actual WSL process.
  * Killing only the svchost left vllm running and caused EADDRINUSE on restart.
+ *
+ * PIDs in the never-kill set (Service Manager and its ancestors, the claude /
+ * opencode terminal daemons, and PIDs tracked for a different service) are always
+ * skipped and logged — freeing a port must never take out infrastructure.
  * @param port - TCP port number to kill
+ * @param opts - owning service id and the PIDs Service Manager spawned for it
  */
-export async function killPort(port: number): Promise<{ killed: boolean; pids: number[]; wsl: boolean }> {
+export async function killPort(port: number, opts: KillPortOptions = {}): Promise<{ killed: boolean; pids: number[]; wsl: boolean }> {
   await deletePortProxyRulesOnPort(port)
 
-  const [windowsPids, wslPids] = await Promise.all([
+  const [windowsPids, wslPids, guard] = await Promise.all([
     getWindowsPidsOnPort(port),
     getWslPidsOnPort(port),
+    resolveProtectedPids(opts.ownerServiceId),
   ])
 
+  const { killable, blocked } = partitionKillablePids(windowsPids, guard.protectedPids)
+  logBlockedPids(`killPort(${port})`, blocked)
+
+  // Only PIDs Service Manager spawned for THIS service may be tree-killed.
+  const treePids = new Set<number>()
+  for (const spawned of opts.spawnedPids ?? []) {
+    for (const pid of killable) {
+      if (pid === spawned || ancestorsOf(pid, guard.table.ppidByPid).includes(spawned)) treePids.add(pid)
+    }
+    if (killable.includes(spawned)) treePids.add(spawned)
+  }
+
   const [killedWindows, killedWsl] = await Promise.all([
-    windowsPids.length > 0 ? killWindowsPids(windowsPids) : Promise.resolve([] as number[]),
+    killable.length > 0 ? killWindowsPids(killable, treePids) : Promise.resolve([] as number[]),
     wslPids.length > 0 ? killWslPids(wslPids) : Promise.resolve([] as number[]),
   ])
 
@@ -328,12 +377,19 @@ export async function killPort(port: number): Promise<{ killed: boolean; pids: n
 
 /**
  * Extracts the working directory from a service start command (the path after "cd" or "cd /d").
- * Returns null if no cd command is found.
+ * The `cd` token is anchored to a statement/word boundary so it cannot match the
+ * letters "cd" inside another word, and only absolute paths are accepted — a bogus
+ * relative fragment used as a kill filter would have an unbounded blast radius.
+ * Returns null if no usable directory is found.
  * @param command - the service start command string
  */
 export function extractServiceDir(command: string): string | null {
-  const match = command.match(/cd\s+(?:\/d\s+)?(?:"([^"]+)"|'([^']+)'|([^\s\r\n]+))/i)
-  return match?.[1] ?? match?.[2] ?? match?.[3] ?? null
+  const match = command.match(/(?:^|[\s&|(])cd\s+(?:\/d\s+)?(?:"([^"]+)"|'([^']+)'|([^\s\r\n]+))/i)
+  const dir = match?.[1] ?? match?.[2] ?? match?.[3] ?? null
+  if (!dir) return null
+  const trimmed = dir.trim()
+  const isAbsolute = /^[a-z]:[\\/]/i.test(trimmed) || /^\\\\/.test(trimmed)
+  return isAbsolute ? trimmed : null
 }
 
 /**
@@ -344,15 +400,40 @@ export function extractServiceDir(command: string): string | null {
  * @param dir - service working directory (e.g. "C:\\jason\\dev\\ai-proxy")
  * @param cmdFragment - secondary pattern to avoid killing unrelated processes (e.g. "node_modules")
  */
-export async function killMatchingProcesses(dir: string, cmdFragment: string): Promise<void> {
-  const script = [
-    'Get-CimInstance Win32_Process',
-    `| Where-Object { $_.CommandLine -like '*${dir}*' -and $_.CommandLine -like '*${cmdFragment}*' }`,
-    '| ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }',
-  ].join(' ')
-  const encoded = Buffer.from(script, 'utf16le').toString('base64')
-  await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded])
-    .catch((err: any) => console.error('[portHelper] killMatchingProcesses failed:', err.message))
+export async function killMatchingProcesses(dir: string, cmdFragment: string, ownerServiceId?: string): Promise<void> {
+  if (!dir) return
+
+  const table = await snapshotProcessTable()
+  if (table.commandLineByPid.size === 0) {
+    console.warn('[portHelper] killMatchingProcesses: process table unavailable — killing nothing')
+    return
+  }
+
+  const fragment = cmdFragment.toLowerCase()
+  const candidates: number[] = []
+  for (const [pid, commandLine] of table.commandLineByPid) {
+    if (!commandLine.toLowerCase().includes(fragment)) continue
+    if (!commandLineTargetsDir(commandLine, dir)) continue
+    candidates.push(pid)
+  }
+  if (candidates.length === 0) return
+
+  const protectedPids = buildProtectedPids({
+    selfPid: process.pid,
+    table,
+    trackedPidsByServiceId: getTrackedPids(),
+    ownerServiceId,
+  })
+  const { killable, blocked } = partitionKillablePids(candidates, protectedPids)
+  logBlockedPids(`killMatchingProcesses(${dir})`, blocked)
+
+  for (const pid of killable) {
+    await execAsync(`taskkill /PID ${pid} /F`).catch((err: any) => {
+      if (!err.message?.includes('not found')) {
+        console.error(`[portHelper] killMatchingProcesses: failed to kill PID ${pid}:`, err.message)
+      }
+    })
+  }
 }
 
 /**

@@ -99,6 +99,43 @@ describe('diffProfiles', () => {
     expect(actions.get('svc-1')).toBe('start')
   })
 
+  // ── task-609: profile switches must not stop things they never started ─────
+
+  it('leaves a shared service running and attached when both profiles match (2 Comfy case)', () => {
+    const shared = cfg({ startOnBoot: true, cudaDevice: '0' })
+    const actions = diffProfiles([shared], [shared], running)
+    expect(actions.get('svc-1')).toBe('noop')
+  })
+
+  it('does NOT stop a manually-started service that neither profile auto-starts', () => {
+    const manual = cfg({ startOnBoot: false })
+    const actions = diffProfiles([manual], [manual], running)
+    expect(actions.get('svc-1')).toBe('noop')
+  })
+
+  it('stops a running service only when the OUTGOING profile was managing it', () => {
+    const wasManaged = diffProfiles([cfg({ startOnBoot: true })], [cfg({ startOnBoot: false })], running)
+    const neverManaged = diffProfiles([cfg({ startOnBoot: false })], [cfg({ startOnBoot: false })], running)
+    expect(wasManaged.get('svc-1')).toBe('stop')
+    expect(neverManaged.get('svc-1')).toBe('noop')
+  })
+
+  it('never touches a protected service, whatever the diff says', () => {
+    const isProtected = (_id: string) => true
+    expect(diffProfiles([cfg({ startOnBoot: true })], [cfg({ startOnBoot: false })], running, isProtected).get('svc-1')).toBe('noop')
+    expect(diffProfiles([cfg({ cudaDevice: '0' })], [cfg({ cudaDevice: '1' })], running, isProtected).get('svc-1')).toBe('noop')
+    expect(diffProfiles([cfg({ startOnBoot: false })], [cfg({ startOnBoot: true })], notRunning, isProtected).get('svc-1')).toBe('noop')
+  })
+
+  it('does not restart a running service that is leaving the profile, even if its config changed', () => {
+    const actions = diffProfiles(
+      [cfg({ startOnBoot: true, cudaDevice: '0' })],
+      [cfg({ startOnBoot: false, cudaDevice: '1' })],
+      running
+    )
+    expect(actions.get('svc-1')).toBe('stop')
+  })
+
   it('handles multiple services independently', () => {
     const svc2: EffectiveConfig = { serviceId: 'svc-2', command: 'cmd', port: null, cudaDevice: null, startOnBoot: false }
     const isRunning = (id: string) => id === 'svc-1'

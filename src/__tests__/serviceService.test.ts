@@ -10,6 +10,9 @@ const mockProcessManager = {
   getOutput: jest.fn(() => []),
   clearOutput: jest.fn(),
   adoptExternal: jest.fn(),
+  adoptNoPort: jest.fn(),
+  getSpawnedPids: jest.fn((_id: string) => [] as number[]),
+  getTrackedPidsByService: jest.fn(() => new Map<string, number[]>()),
 }
 
 jest.mock('@/lib/process-manager', () => ({
@@ -158,7 +161,7 @@ describe('serviceService.stopService', () => {
     await serviceService.stopService('svc-1')
 
     expect(mockProcessManager.stopService).toHaveBeenCalled()
-    expect(mockKillPort).toHaveBeenCalledWith(9999)
+    expect(mockKillPort).toHaveBeenCalledWith(9999, expect.objectContaining({ ownerServiceId: expect.any(String) }))
   })
 
   it('does not call killPort if process stopped cleanly', async () => {
@@ -253,5 +256,21 @@ describe('serviceService.createService', () => {
       'svc-1',
       { cudaDevice: '0', startOnBoot: true }
     )
+  })
+
+  // task-609: adding the Gitea service on port 3000 appeared to kill the claude
+  // terminal. Creating a service must perform ZERO process operations — the kill
+  // only ever comes from a later start/restart.
+  it('performs no process operations at all when creating a service', async () => {
+    const { killPort, killMatchingProcesses } = require('@/lib/util/portHelper')
+    mockRepo.create.mockResolvedValue(makeService({ port: 3000 }))
+
+    await serviceService.createService({ name: 'Local GitHub (Gitea)', command: 'call start-gitea.bat', port: 3000, startOnBoot: true })
+
+    expect(killPort).not.toHaveBeenCalled()
+    expect(killMatchingProcesses).not.toHaveBeenCalled()
+    expect(mockProcessManager.startService).not.toHaveBeenCalled()
+    expect(mockProcessManager.stopService).not.toHaveBeenCalled()
+    expect(mockProcessManager.restartService).not.toHaveBeenCalled()
   })
 })

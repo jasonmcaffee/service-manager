@@ -4,9 +4,32 @@ import { EventEmitter } from 'events'
 import { writeStartupScript } from '@/lib/util/batchWriter'
 import { logTailer, getLogFilePath } from '@/lib/util/logTailer'
 import { killWslPids } from '@/lib/util/portHelper'
+import { setTrackedPidsProvider, snapshotProcessTable, buildProtectedPids } from '@/lib/util/processGuard'
 import { onShutdown, fireAllSync } from '@/lib/lifecycle'
 
 const treeKill = require('tree-kill')
+
+// Environment variables that must never be inherited by a spawned service.
+// `NoDefaultCurrentDirectoryInExePath` is set by some agent/terminal shells; when
+// Service Manager inherits it, every service batch script loses cmd.exe's default
+// "look in the current directory" behaviour, so `cd /d <dir>` + `app.exe` fails
+// with "not recognized as an internal or external command". Whether a service
+// starts must not depend on which shell Service Manager itself was launched from.
+const STRIPPED_ENV_VARS = ['NoDefaultCurrentDirectoryInExePath']
+
+/**
+ * Builds the environment a spawned service inherits: the manager's own env minus
+ * variables that would change how the service's startup script behaves.
+ */
+function buildSpawnEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  for (const key of STRIPPED_ENV_VARS) {
+    for (const actual of Object.keys(env)) {
+      if (actual.toLowerCase() === key.toLowerCase()) delete env[actual]
+    }
+  }
+  return env
+}
 
 export type ServiceStatus = 'running' | 'stopped' | 'starting' | 'error'
 export type AdoptionKind = 'windows' | 'wsl'
@@ -33,6 +56,13 @@ const globalForProcessManager = globalThis as unknown as {
 
 class ProcessManager extends EventEmitter {
   private processes: Map<string, ServiceProcess> = new Map()
+
+  // The cmd.exe/powershell wrapper PID Service Manager spawned per service.
+  // Deliberately NOT stored on the ServiceProcess entry: the reconciler replaces
+  // that entry via adoptExternal() (process: null), which used to make SM forget
+  // the wrapper it owns. The next start then only killed the adopted listener and
+  // orphaned the wrapper, accumulating duplicate service instances (task-609).
+  private spawnedWrappers: Map<string, number> = new Map()
 
   static getInstance(): ProcessManager {
     const existing = globalForProcessManager.processManagerInstance
@@ -66,6 +96,90 @@ class ProcessManager extends EventEmitter {
     onShutdown('process-manager:stop-tailers', () => {
       logTailer.stopAll()
     })
+    // Lets portHelper's kill guard see which PIDs belong to which service without
+    // importing the process manager (portHelper is a dependency of this module).
+    setTrackedPidsProvider(() => this.getTrackedPidsByService())
+  }
+
+  /**
+   * Returns every PID Service Manager associates with each service — the tracked
+   * process PID and the spawned wrapper PID. Used to build the never-kill set so
+   * freeing one service's port can never kill another service's process.
+   */
+  getTrackedPidsByService(): Map<string, number[]> {
+    const result = new Map<string, number[]>()
+    for (const [id, proc] of this.processes) {
+      const pids: number[] = []
+      if (proc.pid) pids.push(proc.pid)
+      if (proc.process?.pid) pids.push(proc.process.pid)
+      if (pids.length > 0) result.set(id, pids)
+    }
+    for (const [id, wrapperPid] of this.spawnedWrappers) {
+      const pids = result.get(id) ?? []
+      if (!pids.includes(wrapperPid)) pids.push(wrapperPid)
+      result.set(id, pids)
+    }
+    return result
+  }
+
+  /**
+   * Returns the PIDs Service Manager itself spawned for a service. Only these may
+   * be tree-killed (`taskkill /T`) when freeing the service's port.
+   * @param serviceId - service to query
+   */
+  getSpawnedPids(serviceId: string): number[] {
+    const pids: number[] = []
+    const wrapper = this.spawnedWrappers.get(serviceId)
+    if (wrapper) pids.push(wrapper)
+    const child = this.processes.get(serviceId)?.process?.pid
+    if (child && !pids.includes(child)) pids.push(child)
+    return pids
+  }
+
+  /**
+   * Tree-kills a wrapper process left over from a previous start of this service,
+   * if it is still alive. Without this, a service whose entry was replaced by
+   * adoption gets a second wrapper on every start and the old one keeps running.
+   * @param serviceId - service whose stale wrapper should be reaped
+   */
+  /**
+   * Finds and tree-kills EVERY wrapper process still running for this service,
+   * not just the one in the in-memory registry. Wrappers are identified by the
+   * unique `service-<serviceId>` startup-script path in their command line, so
+   * this also reaps wrappers orphaned by an earlier Service Manager process —
+   * the reason Dynamic DNS Updater accumulated four live instances.
+   * Best-effort: if the process table can't be read, only the registry entry is used.
+   * @param serviceId - service whose wrapper processes should be reaped
+   */
+  private async reapWrapperProcesses(serviceId: string): Promise<void> {
+    this.reapStaleWrapper(serviceId)
+
+    const table = await snapshotProcessTable()
+    if (table.commandLineByPid.size === 0) return
+
+    const protectedPids = buildProtectedPids({
+      selfPid: process.pid,
+      table,
+      trackedPidsByServiceId: this.getTrackedPidsByService(),
+      ownerServiceId: serviceId,
+    })
+    const marker = `service-${serviceId}`.toLowerCase()
+
+    for (const [pid, commandLine] of table.commandLineByPid) {
+      if (!commandLine.toLowerCase().includes(marker)) continue
+      if (protectedPids.has(pid)) continue
+      console.log(`[process-manager] reaping stale wrapper pid=${pid} for ${serviceId}`)
+      try { treeKill(pid, 'SIGKILL') } catch { /* best-effort */ }
+    }
+  }
+
+  reapStaleWrapper(serviceId: string): void {
+    const wrapperPid = this.spawnedWrappers.get(serviceId)
+    if (!wrapperPid) return
+    this.spawnedWrappers.delete(serviceId)
+    if (!this.isProcessRunning(wrapperPid)) return
+    console.log(`[process-manager] reaping orphaned wrapper pid=${wrapperPid} for ${serviceId}`)
+    try { treeKill(wrapperPid, 'SIGKILL') } catch { /* best-effort */ }
   }
 
   /**
@@ -241,6 +355,9 @@ class ProcessManager extends EventEmitter {
     if (existing?.status === 'running' || (existing?.process && existing.status === 'error')) {
       await this.stopService(serviceId, onStateChange)
     }
+    // Reap any wrapper left behind by an earlier start (or an earlier Service
+    // Manager process) — otherwise this spawn produces a duplicate instance.
+    await this.reapWrapperProcesses(serviceId)
 
     const { scriptFile, logFile } = writeStartupScript(serviceId, command, env)
     const isPowerShell = scriptFile.endsWith('.ps1')
@@ -271,11 +388,12 @@ class ProcessManager extends EventEmitter {
         cwd: process.cwd(),
         shell: false,
         windowsHide: true,
-        env: { ...process.env },
+        env: buildSpawnEnv(),
       })
 
       serviceProcess.process = child
       serviceProcess.pid = child.pid
+      if (child.pid) this.spawnedWrappers.set(serviceId, child.pid)
       serviceProcess.status = 'running'
       this.emit('status-change', serviceId, 'running')
       if (onStateChange) await onStateChange('running', child.pid)
@@ -284,6 +402,7 @@ class ProcessManager extends EventEmitter {
       logTailer.start(serviceId, logFile, true)
 
       child.on('exit', async (code) => {
+        if (this.spawnedWrappers.get(serviceId) === child.pid) this.spawnedWrappers.delete(serviceId)
         const proc = this.processes.get(serviceId)
         if (proc) {
           proc.status = code === 0 ? 'stopped' : 'error'
@@ -345,6 +464,7 @@ class ProcessManager extends EventEmitter {
     // WSL-adopted processes must be killed via `wsl kill -9`, not tree-kill
     if (serviceProcess?.adoption === 'wsl') {
       await killWslPids([pid])
+      this.reapStaleWrapper(serviceId)
       if (serviceProcess) {
         serviceProcess.status = 'stopped'
         serviceProcess.process = null
@@ -383,6 +503,9 @@ class ProcessManager extends EventEmitter {
     serviceProcess: ServiceProcess | undefined,
     onStateChange?: (status: ServiceStatus, pid?: number) => Promise<void>
   ): Promise<void> {
+    // A wrapper we spawned may outlive the PID we just killed (adoption replaces
+    // the tracked PID with the listener's). Reap it so nothing is left running.
+    this.reapStaleWrapper(serviceId)
     if (serviceProcess) {
       serviceProcess.status = 'stopped'
       serviceProcess.process = null

@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { killPort, isPortListening } from '@/lib/util/portHelper'
+import { serviceRepository } from '@/lib/repositories/serviceRepository'
+import { processManager } from '@/lib/process-manager'
 
 export async function POST(request: NextRequest) {
   try {
@@ -14,7 +16,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ message: `No process found on port ${port}` }, { status: 404 })
     }
 
-    const { killed, pids, wsl } = await killPort(port)
+    // Scope the kill to whichever registered service owns the port so an explicit
+    // "Kill Port" is allowed to stop that service's own process, while every other
+    // service (and the agent terminal daemons) stays protected.
+    const owner = (await serviceRepository.findByPort(port))[0]
+    const { killed, pids, wsl } = await killPort(port, {
+      ownerServiceId: owner?.id,
+      spawnedPids: owner ? processManager.getSpawnedPids(owner.id) : undefined,
+    })
 
     if (killed) {
       const prefix = wsl ? 'WSL ' : ''

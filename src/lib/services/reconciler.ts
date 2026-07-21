@@ -1,10 +1,16 @@
+import fs from 'fs'
 import { processManager } from '@/lib/process-manager'
 import { serviceRepository } from '@/lib/repositories/serviceRepository'
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { snapshotWindowsListeners, snapshotWslListeners, isWslProxyPid } from '@/lib/util/portHelper'
+import { getLogFilePath } from '@/lib/util/logTailer'
 import { onShutdown } from '@/lib/lifecycle'
 
 const TICK_INTERVAL_MS = 10_000
+
+// A noPort service has no port to probe, so log-file freshness is the only
+// available liveness signal. Matches the window init uses at boot.
+const LOG_FRESHNESS_MS = 30 * 60 * 1000
 
 const globalForReconciler = globalThis as unknown as { reconcilerInstance: Reconciler | undefined }
 
@@ -84,11 +90,56 @@ class Reconciler {
       const claimedPids = new Set<string>()
 
       for (const svc of ranked) {
-        if (!svc.port) continue // noPort services use log-freshness, handled at init
-        await this.reconcileFromOS(svc, winMap, wslMap, claimedPorts, claimedPids)
+        // Per-service isolation: one service throwing (a huge log file, a locked
+        // file handle, a DB hiccup) must never abort reconciliation for the rest
+        // of the list — that left healthy services painted "stopped" in the UI.
+        try {
+          if (svc.port) {
+            await this.reconcileFromOS(svc, winMap, wslMap, claimedPorts, claimedPids)
+          } else {
+            await this.reconcileNoPortService(svc)
+          }
+        } catch (err: any) {
+          console.error(`[reconciler] "${svc.name}" reconcile failed (continuing):`, err?.message ?? err)
+        }
       }
     } catch (err) {
       console.error('[reconciler] tick error:', err)
+    }
+  }
+
+  /**
+   * Reconciles a service that has no port, using log-file freshness as the
+   * liveness signal. A live spawned child is trusted over the log. Never kills
+   * anything — it only adopts or marks state so the UI matches reality.
+   * @param svc - service row from the DB (noPort or port-less)
+   */
+  async reconcileNoPortService(svc: any): Promise<void> {
+    const mem = processManager.getStatus(svc.id)
+
+    // Spawned child still alive — its exit event owns the lifecycle.
+    if (mem?.process && !mem.process.killed && mem.process.exitCode === null) return
+
+    const logFile = getLogFilePath(svc.id)
+    const fresh = fs.existsSync(logFile) && (Date.now() - fs.statSync(logFile).mtimeMs) <= LOG_FRESHNESS_MS
+
+    if (fresh) {
+      if (mem?.status !== 'running') {
+        console.log(`[reconciler] "${svc.name}" (noPort) → running via fresh log`)
+        processManager.adoptNoPort(svc.id)
+      }
+      if (svc.status !== 'running') {
+        await serviceRepository.update(svc.id, { status: 'running', pid: null })
+      }
+      return
+    }
+
+    if (mem?.status === 'running') {
+      processManager.markUnhealthy(svc.id, 'log-stale')
+    }
+    if (svc.status === 'running') {
+      console.log(`[reconciler] "${svc.name}" (noPort) log stale — marking stopped`)
+      await serviceRepository.update(svc.id, { status: 'stopped', pid: null })
     }
   }
 

@@ -13,6 +13,7 @@ const mockVerifyHealthWithMaps = jest.fn(() => ({ healthy: true }))
 const mockMarkUnhealthy = jest.fn()
 const mockGetStatus = jest.fn((): any => undefined)
 const mockAdoptExternal = jest.fn()
+const mockAdoptNoPort = jest.fn()
 
 jest.mock('@/lib/process-manager', () => ({
   processManager: {
@@ -20,7 +21,21 @@ jest.mock('@/lib/process-manager', () => ({
     verifyHealthWithMaps: mockVerifyHealthWithMaps,
     markUnhealthy: mockMarkUnhealthy,
     adoptExternal: mockAdoptExternal,
+    adoptNoPort: mockAdoptNoPort,
   },
+}))
+
+// noPort services are reconciled from log-file freshness, so fs + the log path
+// helper are mocked to let each test choose a log age.
+const mockExistsSync = jest.fn(() => false)
+const mockStatSync = jest.fn(() => ({ mtimeMs: Date.now() }))
+jest.mock('fs', () => ({
+  existsSync: (...args: any[]) => mockExistsSync.apply(null, args as any),
+  statSync: (...args: any[]) => mockStatSync.apply(null, args as any),
+}))
+
+jest.mock('@/lib/util/logTailer', () => ({
+  getLogFilePath: (id: string) => `/tmp/service-${id}.log`,
 }))
 
 const mockFindAll = jest.fn(async () => [] as any[])
@@ -87,16 +102,61 @@ describe('Reconciler.tick — snapshot behavior', () => {
     expect(mockSnapshotWsl).toHaveBeenCalledTimes(1)
   })
 
-  it('ignores noPort services (they use log-freshness, not port snapshots)', async () => {
+  it('never adopts a noPort service from the port snapshots', async () => {
     mockFindAll.mockResolvedValue([
-      { id: 'noport-svc', port: null, status: 'running' },
+      { id: 'noport-svc', name: 'noport', port: null, status: 'running' },
     ])
     mockGetStatus.mockReturnValue(undefined)
+    mockExistsSync.mockReturnValue(true)
+    mockStatSync.mockReturnValue({ mtimeMs: Date.now() })
+
+    await reconciler.tick()
+
+    expect(mockAdoptExternal).not.toHaveBeenCalled()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('Reconciler.tick — noPort services (log freshness)', () => {
+  it('adopts an untracked noPort service whose log was just written', async () => {
+    mockFindAll.mockResolvedValue([
+      { id: 'noport-svc', name: 'Dynamic DNS Updater', port: null, status: 'stopped' },
+    ])
+    mockGetStatus.mockReturnValue(undefined)
+    mockExistsSync.mockReturnValue(true)
+    mockStatSync.mockReturnValue({ mtimeMs: Date.now() - 5_000 })
+
+    await reconciler.tick()
+
+    expect(mockAdoptNoPort).toHaveBeenCalledWith('noport-svc')
+    expect(mockUpdate).toHaveBeenCalledWith('noport-svc', { status: 'running', pid: null })
+  })
+
+  it('marks a noPort service stopped when its log has gone stale', async () => {
+    mockFindAll.mockResolvedValue([
+      { id: 'noport-svc', name: 'Dynamic DNS Updater', port: null, status: 'running' },
+    ])
+    mockGetStatus.mockReturnValue({ status: 'running', process: null })
+    mockExistsSync.mockReturnValue(true)
+    mockStatSync.mockReturnValue({ mtimeMs: Date.now() - 2 * 60 * 60 * 1000 })
+
+    await reconciler.tick()
+
+    expect(mockMarkUnhealthy).toHaveBeenCalledWith('noport-svc', 'log-stale')
+    expect(mockUpdate).toHaveBeenCalledWith('noport-svc', { status: 'stopped', pid: null })
+  })
+
+  it('leaves a noPort service alone while its spawned child is alive', async () => {
+    mockFindAll.mockResolvedValue([
+      { id: 'noport-svc', name: 'Dynamic DNS Updater', port: null, status: 'running' },
+    ])
+    mockGetStatus.mockReturnValue({ status: 'running', process: { killed: false, exitCode: null } })
+    mockExistsSync.mockReturnValue(false)
 
     await reconciler.tick()
 
     expect(mockMarkUnhealthy).not.toHaveBeenCalled()
-    expect(mockAdoptExternal).not.toHaveBeenCalled()
+    expect(mockAdoptNoPort).not.toHaveBeenCalled()
     expect(mockUpdate).not.toHaveBeenCalled()
   })
 })

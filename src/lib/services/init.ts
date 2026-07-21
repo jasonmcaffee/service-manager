@@ -212,6 +212,17 @@ export interface AutoStartResult {
   error?: string
 }
 
+// Delays (ms after the first autostart pass) at which failed start-on-boot
+// services are re-attempted. On a cold boot a GPU service (llama.cpp) can fail
+// its very first launch because the NVIDIA driver / second GPU isn't ready yet,
+// and a plain start-on-boot has no retry so it stays dead until a manual Start.
+// These sweeps re-run the idempotent autostart for any flagged service still not
+// running. They're bounded to the first few minutes after boot so a service the
+// user deliberately stops later is never resurrected.
+const AUTOSTART_RETRY_DELAYS_MS = [30_000, 90_000, 180_000]
+
+const globalForAutostartRetry = globalThis as unknown as { smAutostartRetriesScheduled?: boolean }
+
 /**
  * Builds a state-change callback that persists a service's status/pid to the DB
  * as the process manager transitions it through starting/running/stopped.
@@ -244,9 +255,12 @@ async function startOneAutoStartService(entry: any): Promise<AutoStartResult> {
     if (service.port) {
       if (!service.wsl) {
         const dir = extractServiceDir(service.command)
-        if (dir) await killMatchingProcesses(dir, 'node_modules')
+        if (dir) await killMatchingProcesses(dir, 'node_modules', service.id)
       }
-      await killPort(service.port)
+      await killPort(service.port, {
+        ownerServiceId: service.id,
+        spawnedPids: processManager.getSpawnedPids(service.id),
+      })
     }
     console.log(`[init] autostart starting "${service.name}"`)
     await processManager.startService(service.id, service.command, env, makeOnStateChange(service.id))
@@ -283,7 +297,49 @@ export async function startAutoStartServices(): Promise<AutoStartResult[]> {
   const running = results.filter(r => r.status === 'already_running').length
   const errored = results.filter(r => r.status === 'error').length
   console.log(`[init] autostart complete: ${started} started, ${running} already running, ${errored} errored`)
+  scheduleAutoStartRetries()
   return results
+}
+
+/**
+ * Re-attempts every start-on-boot service in the active profile that is not
+ * currently running. Reuses the idempotent startOneAutoStartService, which skips
+ * services already up/adopted, so only genuinely-failed services are (re)started.
+ * A single sweep pass — invoked on a timer by scheduleAutoStartRetries.
+ * @param attempt - 1-based sweep number, for logging
+ */
+export async function retryFailedAutoStartServices(attempt: number): Promise<void> {
+  const active = await runProfileRepository.findActive()
+  if (!active) return
+  const entries = await runProfileRepository.findAutoStartServices(active.id)
+  const down = entries.filter((e: any) => !processManager.isRunning(e.service.id))
+  if (down.length === 0) {
+    console.log(`[init] autostart retry #${attempt}: all start-on-boot services running`)
+    return
+  }
+  console.log(`[init] autostart retry #${attempt}: re-attempting ${down.length} down service(s): ${down.map((e: any) => e.service.name).join(', ')}`)
+  for (const entry of down) {
+    const result = await startOneAutoStartService(entry)
+    if (result.status === 'started') await new Promise(r => setTimeout(r, 1000))
+  }
+}
+
+/**
+ * Schedules the delayed retry sweeps (once per manager boot) that self-heal
+ * start-on-boot services which failed their first launch — most notably the
+ * GPU-backed llama.cpp server after a cold reboot when the driver wasn't ready.
+ * Guarded on globalThis so HMR / repeated init calls don't stack timers.
+ */
+function scheduleAutoStartRetries(): void {
+  if (globalForAutostartRetry.smAutostartRetriesScheduled) return
+  globalForAutostartRetry.smAutostartRetriesScheduled = true
+  AUTOSTART_RETRY_DELAYS_MS.forEach((delay, i) => {
+    setTimeout(() => {
+      retryFailedAutoStartServices(i + 1).catch(err =>
+        console.error(`[init] autostart retry #${i + 1} failed:`, err.message)
+      )
+    }, delay).unref?.()
+  })
 }
 
 /**

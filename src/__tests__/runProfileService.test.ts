@@ -5,6 +5,10 @@ const mockProcessManager = {
   stopService: jest.fn(async () => {}),
   restartService: jest.fn(async () => {}),
   adoptExternal: jest.fn(),
+  adoptNoPort: jest.fn(),
+  getStatus: jest.fn(() => undefined as any),
+  getSpawnedPids: jest.fn((_id: string) => [] as number[]),
+  getTrackedPidsByService: jest.fn(() => new Map<string, number[]>()),
 }
 
 jest.mock('@/lib/process-manager', () => ({
@@ -58,6 +62,8 @@ beforeEach(() => {
   jest.clearAllMocks()
   mockProfileRepo.count.mockResolvedValue(1)
   mockProfileRepo.findActive.mockResolvedValue({ id: 'profile-1', name: 'Default', isActive: true, services: [] })
+  // clearAllMocks keeps implementations, so reset the per-test override explicitly
+  mockProfileRepo.findProfileService.mockResolvedValue(null)
   mockProfileRepo.findAutoStartServices.mockResolvedValue([])
   mockProcessManager.isRunning.mockReturnValue(false)
 })
@@ -161,6 +167,9 @@ describe('runProfileService.switchProfile — diff behaviour', () => {
     mockServiceRepo.findById.mockResolvedValue(svc1)
     mockProcessManager.isRunning.mockReturnValue(true)
     mockProfileRepo.setActive.mockResolvedValue(nextWithCuda)
+    // Profile switches now run through serviceService, which resolves CUDA_DEVICE
+    // from the (already-activated) profile override rather than the diff config.
+    mockProfileRepo.findProfileService.mockResolvedValue({ cudaDevice: '1', startOnBoot: true } as any)
 
     await runProfileService.switchProfile('profile-2')
 

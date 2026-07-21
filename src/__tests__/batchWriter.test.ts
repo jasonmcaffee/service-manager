@@ -50,10 +50,12 @@ describe('batchWriter — writeStartupScript', () => {
     expect(inner).toContain('python main.py')
   })
 
-  it('outer bat redirects output to the log file via call >> logfile', () => {
+  it('outer bat sends the inner bat output to the log file', () => {
     const { scriptFile, logFile } = writeStartupScript('test-5', 'echo hi', {})
     const outer = fs.readFileSync(scriptFile, 'utf-8')
-    expect(outer).toContain('>>')
+    // Output reaches the log either through the size-capping writer (preferred)
+    // or a plain append redirect when that script is unavailable.
+    expect(outer).toMatch(/log-cap-writer\.cjs|>>/)
     expect(outer).toContain(logFile)
   })
 
@@ -61,8 +63,9 @@ describe('batchWriter — writeStartupScript', () => {
     const { scriptFile } = writeStartupScript('test-6', 'echo hi', {})
     const outer = fs.readFileSync(scriptFile, 'utf-8')
     const truncateIdx = outer.indexOf('type nul')
-    const callIdx = outer.indexOf('>>')
+    const callIdx = outer.indexOf('call "')
     expect(truncateIdx).toBeGreaterThan(-1)
+    expect(callIdx).toBeGreaterThan(-1)
     expect(truncateIdx).toBeLessThan(callIdx)
   })
 
@@ -73,10 +76,10 @@ describe('batchWriter — writeStartupScript', () => {
     expect(inner).toContain('cd C:\\myproject')
     expect(inner).toContain('pip install -r requirements.txt')
     expect(inner).toContain('python main.py')
-    // The outer bat must use call ... >> to redirect all output
+    // The outer bat must call the inner bat once and route all of its output
     const outer = fs.readFileSync(scriptFile, 'utf-8')
     expect(outer).toContain('call ')
-    expect(outer).toContain('>>')
+    expect(outer).toMatch(/log-cap-writer\.cjs|>>/)
   })
 
   it('sets PYTHONUNBUFFERED=1 in the outer bat before calling the inner bat', () => {
