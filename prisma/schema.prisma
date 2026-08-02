@@ -16,6 +16,8 @@ model Service {
   noPort        Boolean              @default(false)
   wsl           Boolean              @default(false)
   cudaDevice    String?
+  /// Free VRAM (MB) this service needs on each GPU it is pinned to. Null = no admission check.
+  minFreeVramMb Int?
   startOnBoot   Boolean              @default(false)
 
   pid           Int?

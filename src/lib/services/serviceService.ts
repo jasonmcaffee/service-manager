@@ -5,6 +5,7 @@ import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { initializeIfNeeded, startAutoStartServices } from '@/lib/services/init'
 import { killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy } from '@/lib/util/portHelper'
 import { getLogFilePath, readLogFileCapped, INITIAL_TAIL_BYTES } from '@/lib/util/logTailer'
+import { checkVramAdmission, parseCudaDevices, queryGpuMemory } from '@/lib/util/gpuGuard'
 
 /**
  * Reads the tail of a service's log file and returns its lines, or an empty array
@@ -58,6 +59,78 @@ async function freePortForService(service: any): Promise<void> {
     ownerServiceId: service.id,
     spawnedPids: processManager.getSpawnedPids(service.id),
   })
+}
+
+/**
+ * Returns the cudaDevice that will actually be handed to a service at spawn time:
+ * the active profile's override when there is one, else the service row's own value.
+ * Mirrors buildEnvForService so the guard reasons about the same GPU the process gets.
+ * @param serviceId - the service being inspected
+ * @param fallback - the service row's cudaDevice
+ */
+async function resolveEffectiveCudaDevice(serviceId: string, fallback: string | null): Promise<string | null> {
+  const active = await runProfileRepository.findActive()
+  if (!active) return fallback
+  const override = await runProfileRepository.findProfileService(active.id, serviceId)
+  return override?.cudaDevice ?? fallback
+}
+
+/**
+ * Maps each GPU index to the names of the services currently RUNNING on it, so a
+ * refusal can name what is holding the card instead of just reporting a number.
+ * @param excludeServiceId - the service being started, which is never its own occupant
+ */
+async function buildGpuOccupants(excludeServiceId: string): Promise<Map<number, string[]>> {
+  const occupants = new Map<number, string[]>()
+  const services = await serviceRepository.findAll()
+
+  for (const svc of services) {
+    if (svc.id === excludeServiceId) continue
+    if (!processManager.isRunning(svc.id)) continue
+    const cudaDevice = await resolveEffectiveCudaDevice(svc.id, svc.cudaDevice ?? null)
+    for (const index of parseCudaDevices(cudaDevice)) {
+      const names = occupants.get(index) ?? []
+      names.push(svc.name)
+      occupants.set(index, names)
+    }
+  }
+  return occupants
+}
+
+/**
+ * Blocks a stopped→running transition that would over-subscribe a GPU, throwing 409
+ * with a message naming the occupying service. Without this, starting a second heavy
+ * CUDA service on an already-full card hard-hangs the whole machine rather than
+ * failing cleanly (task-1406): ComfyUI is masked to a single device and run with
+ * --disable-dynamic-vram, so it believes it owns all the card's memory.
+ *
+ * Only guards services that declare a `minFreeVramMb`; everything else starts as before.
+ * @param service - the service row about to be started
+ */
+async function assertVramAvailable(service: any): Promise<void> {
+  const cudaDevice = await resolveEffectiveCudaDevice(service.id, service.cudaDevice ?? null)
+  if (parseCudaDevices(cudaDevice).length === 0) return
+  if (!service.minFreeVramMb) return
+
+  const [gpus, occupantsByDevice] = await Promise.all([
+    queryGpuMemory(),
+    buildGpuOccupants(service.id),
+  ])
+
+  const verdict = checkVramAdmission({
+    serviceName: service.name,
+    cudaDevice,
+    minFreeVramMb: service.minFreeVramMb,
+    gpus,
+    occupantsByDevice,
+  })
+
+  if (!verdict.allowed) {
+    console.warn(`[gpuGuard] ${verdict.reason}`)
+    const err = new Error(verdict.reason)
+    ;(err as any).statusCode = 409
+    throw err
+  }
 }
 
 function validatePort(port: number | null | undefined) {
@@ -205,6 +278,7 @@ export const serviceService = {
       throw err
     }
 
+    await assertVramAvailable(service)
     await freePortForService(service)
 
     const env = await buildEnvForService(id, service.port)
@@ -260,6 +334,10 @@ export const serviceService = {
       throw err
     }
 
+    // A service already running on the GPU releases its own VRAM as part of the
+    // restart, so the net change is ~zero — guarding it would only false-positive.
+    // A restart of a STOPPED service is a real stopped→running transition.
+    if (!processManager.isRunning(id)) await assertVramAvailable(service)
     await freePortForService(service)
 
     const env = await buildEnvForService(id, service.port)

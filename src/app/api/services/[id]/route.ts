@@ -20,7 +20,7 @@ export async function PUT(
 ) {
   try {
     const body = await request.json()
-    const { name, description, command, port, noPort, wsl } = body
+    const { name, description, command, port, noPort, wsl, minFreeVramMb } = body
 
     // Only include fields present in the request body so callers can patch a
     // single field (e.g. wsl=true) without triggering port-uniqueness checks
@@ -32,6 +32,7 @@ export async function PUT(
     if (port !== undefined) input.port = port ?? null
     if (noPort !== undefined) input.noPort = noPort
     if (wsl !== undefined) input.wsl = wsl
+    if (minFreeVramMb !== undefined) input.minFreeVramMb = minFreeVramMb ?? null
 
     const service = await serviceService.updateService(params.id, input as any)
 

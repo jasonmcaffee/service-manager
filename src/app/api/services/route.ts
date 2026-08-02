@@ -13,7 +13,7 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { name, description, command, startOnBoot, port, noPort, wsl, cudaDevice } = body
+    const { name, description, command, startOnBoot, port, noPort, wsl, cudaDevice, minFreeVramMb } = body
 
     const service = await serviceService.createService({
       name,
@@ -24,6 +24,7 @@ export async function POST(request: NextRequest) {
       noPort: noPort ?? false,
       wsl: wsl ?? false,
       cudaDevice: cudaDevice ?? null,
+      minFreeVramMb: minFreeVramMb ?? null,
     })
 
     return NextResponse.json(service, { status: 201 })

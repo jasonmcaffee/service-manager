@@ -39,6 +39,8 @@ const mockProfileRepo = {
   })),
   createProfileServicesForAllProfiles: jest.fn(async () => {}),
   cloneProfileServices: jest.fn(async () => {}),
+  backfillProfileServices: jest.fn(async () => 0),
+  delete: jest.fn(async (_id: string) => {}),
   findAutoStartServices: jest.fn(async () => []),
   count: jest.fn(async () => 1),
   rename: jest.fn(async (id: string, name: string) => ({ id, name, isActive: false, services: [] })),

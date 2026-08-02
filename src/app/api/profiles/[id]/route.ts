@@ -16,3 +16,15 @@ export async function PATCH(
     return NextResponse.json({ error: error.message }, { status: error.statusCode ?? 500 })
   }
 }
+
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  try {
+    const result = await runProfileService.deleteProfile(params.id)
+    return NextResponse.json(result)
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: error.statusCode ?? 500 })
+  }
+}

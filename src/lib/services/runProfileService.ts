@@ -76,7 +76,38 @@ export { ensureDefaultProfile }
 export const runProfileService = {
   async listProfiles() {
     await ensureDefaultProfile()
+    // Self-heal any profile that is missing a service, so a newly added service
+    // shows up in EVERY profile rather than only the one it was created under.
+    const added = await runProfileRepository.backfillProfileServices()
+    if (added > 0) console.log(`[runProfileService] backfilled ${added} missing profile-service row(s)`)
     return runProfileRepository.findAll()
+  },
+
+  /**
+   * Deletes a profile. The active profile is protected — removing it would leave
+   * Service Manager with no effective config for cudaDevice/startOnBoot.
+   * @param id - the profile to delete
+   */
+  async deleteProfile(id: string) {
+    const profile = await runProfileRepository.findById(id)
+    if (!profile) {
+      const err = new Error(`Profile not found: ${id}`)
+      ;(err as any).statusCode = 404
+      throw err
+    }
+    if (profile.isActive) {
+      const err = new Error('Cannot delete the active profile. Switch to another profile first.')
+      ;(err as any).statusCode = 409
+      throw err
+    }
+    const count = await runProfileRepository.count()
+    if (count <= 1) {
+      const err = new Error('Cannot delete the last remaining profile.')
+      ;(err as any).statusCode = 409
+      throw err
+    }
+    await runProfileRepository.delete(id)
+    return { id, deleted: true }
   },
 
   async getActiveProfile() {
@@ -128,8 +159,15 @@ export const runProfileService = {
 
     const results: Array<{ id: string; name: string; status: string; error?: string }> = []
 
-    for (const [serviceId, action] of actions) {
-      if (action === 'noop') continue
+    // Stops must land before starts. The outgoing and incoming profiles routinely
+    // trade the same GPU (llama on cuda1 vs the second ComfyUI on cuda1), so
+    // starting first would briefly run both on one card — which does not OOM
+    // cleanly, it hard-hangs the machine (task-1406). Freeing first also releases
+    // ports before the incoming service claims them.
+    const ordered = [...actions].filter(([, action]) => action !== 'noop')
+    ordered.sort(([, a], [, b]) => (a === 'stop' ? 0 : 1) - (b === 'stop' ? 0 : 1))
+
+    for (const [serviceId, action] of ordered) {
       const result = await applyProfileAction(serviceId, action)
       if (result) results.push(result)
     }

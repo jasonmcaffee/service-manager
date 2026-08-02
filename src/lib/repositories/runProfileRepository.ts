@@ -119,6 +119,43 @@ export const runProfileRepository = {
     }
   },
 
+  async delete(id: string) {
+    // RunProfileService rows cascade (onDelete: Cascade on the relation).
+    await prisma.runProfile.delete({ where: { id } })
+  },
+
+  /**
+   * Ensures every profile has a RunProfileService row for every service, creating
+   * the missing ones with neutral defaults (no GPU pin, not started on boot).
+   * Returns how many rows were added, so callers can log real drift.
+   *
+   * This is the self-healing half of "a new service shows up in every profile":
+   * createService writes the rows up front, but any service that predates a profile
+   * — or was added while a write failed — would otherwise be invisible in that
+   * profile forever.
+   */
+  async backfillProfileServices(): Promise<number> {
+    const [profiles, services] = await Promise.all([
+      prisma.runProfile.findMany({ select: { id: true } }),
+      prisma.service.findMany({ select: { id: true } }),
+    ])
+    const existing = await prisma.runProfileService.findMany({
+      select: { profileId: true, serviceId: true },
+    })
+    const have = new Set(existing.map(r => `${r.profileId}:${r.serviceId}`))
+
+    const missing = []
+    for (const profile of profiles) {
+      for (const service of services) {
+        if (have.has(`${profile.id}:${service.id}`)) continue
+        missing.push({ profileId: profile.id, serviceId: service.id, cudaDevice: null, startOnBoot: false })
+      }
+    }
+    if (missing.length === 0) return 0
+    await prisma.runProfileService.createMany({ data: missing })
+    return missing.length
+  },
+
   async findAutoStartServices(profileId: string) {
     return prisma.runProfileService.findMany({
       where: { profileId, startOnBoot: true },

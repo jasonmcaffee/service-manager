@@ -10,6 +10,7 @@ export interface CreateServiceInput {
   // cudaDevice and startOnBoot are profile-specific; stored in RunProfileService
   cudaDevice?: string | null
   startOnBoot?: boolean
+  minFreeVramMb?: number | null
 }
 
 export interface UpdateServiceInput {
@@ -21,6 +22,7 @@ export interface UpdateServiceInput {
   wsl?: boolean
   status?: string
   pid?: number | null
+  minFreeVramMb?: number | null
 }
 
 export const serviceRepository = {
@@ -41,6 +43,7 @@ export const serviceRepository = {
         port: data.port ?? null,
         noPort: data.noPort ?? false,
         wsl: data.wsl ?? false,
+        minFreeVramMb: data.minFreeVramMb ?? null,
         status: 'stopped',
         pid: null,
       },
