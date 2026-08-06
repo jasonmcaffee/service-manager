@@ -35,6 +35,12 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
     cudaDevice: '',
   })
   const [isSaving, setIsSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  // A command that hard-codes CUDA_VISIBLE_DEVICES / --cuda-device owns the GPU
+  // choice; the field is shown but not editable so the registration can never
+  // disagree with the card the process actually gets (task-1493).
+  const pinnedByCommand = service?.cudaDeviceSource === 'command'
 
   useEffect(() => {
     if (service) {
@@ -54,6 +60,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
     if (!service || !formData.name.trim() || !formData.command.trim()) return
 
     setIsSaving(true)
+    setSaveError(null)
     try {
       // Save global fields
       const globalRes = await fetch(`/api/services/${service.id}`, {
@@ -67,20 +74,28 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
         }),
       })
 
-      if (!globalRes.ok) return
+      if (!globalRes.ok) {
+        setSaveError((await globalRes.json().catch(() => null))?.error ?? 'Failed to save service')
+        return
+      }
 
       const updated = await globalRes.json()
 
-      // Save profile-specific fields
+      // Save profile-specific fields. A command-pinned GPU is not sent — the command
+      // is the source of truth for it and the server rejects a contradicting value.
       if (activeProfileId) {
-        await fetch(`/api/profiles/${activeProfileId}/services/${service.id}`, {
+        const profileRes = await fetch(`/api/profiles/${activeProfileId}/services/${service.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            cudaDevice: formData.cudaDevice || null,
+            ...(pinnedByCommand ? {} : { cudaDevice: formData.cudaDevice || null }),
             startOnBoot: formData.startOnBoot,
           }),
         })
+        if (!profileRes.ok) {
+          setSaveError((await profileRes.json().catch(() => null))?.error ?? 'Failed to save profile settings')
+          return
+        }
       }
 
       onSave({
@@ -89,8 +104,9 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
         startOnBoot: formData.startOnBoot,
       })
       onClose()
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to save service:', error)
+      setSaveError(error?.message ?? 'Failed to save service')
     } finally {
       setIsSaving(false)
     }
@@ -200,15 +216,21 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
             <div>
               <label className="block text-sm text-zinc-400 mb-1.5">
                 CUDA Device
-                <FieldBadge type="profile" />
+                <FieldBadge type={pinnedByCommand ? 'global' : 'profile'} />
               </label>
               <input
                 type="text"
                 value={formData.cudaDevice}
                 onChange={(e) => setFormData({ ...formData, cudaDevice: e.target.value })}
-                className="input-field w-full"
+                className="input-field w-full disabled:opacity-60"
                 placeholder="0"
+                disabled={pinnedByCommand}
               />
+              {pinnedByCommand && (
+                <p className="mt-1 text-xs text-zinc-500">
+                  Pinned by the start command — edit the command to change the GPU.
+                </p>
+              )}
             </div>
           </div>
 
@@ -226,6 +248,12 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
               </span>
             </label>
           </div>
+
+          {saveError && (
+            <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded px-3 py-2">
+              {saveError}
+            </p>
+          )}
 
           <div className="flex justify-between pt-4 border-t border-zinc-800">
             <button type="button" onClick={handleDelete} className="btn-danger text-sm">

@@ -4,8 +4,11 @@ import { serviceRepository, CreateServiceInput, UpdateServiceInput } from '@/lib
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { initializeIfNeeded, startAutoStartServices } from '@/lib/services/init'
 import { killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy } from '@/lib/util/portHelper'
-import { getLogFilePath, readLogFileCapped, INITIAL_TAIL_BYTES } from '@/lib/util/logTailer'
-import { checkVramAdmission, parseCudaDevices, queryGpuMemory } from '@/lib/util/gpuGuard'
+import { getLogFilePath, readLogFileCapped, INITIAL_TAIL_BYTES, appendServiceNote } from '@/lib/util/logTailer'
+import {
+  checkVramAdmission, parseCudaDevices, queryGpuMemory, resolveGuardedCudaDevice,
+  describeCudaDeviceConflict, extractCudaDevicesFromCommand, reapGpuSurvivors, buildKnownExecutables,
+} from '@/lib/util/gpuGuard'
 
 /**
  * Reads the tail of a service's log file and returns its lines, or an empty array
@@ -62,17 +65,30 @@ async function freePortForService(service: any): Promise<void> {
 }
 
 /**
- * Returns the cudaDevice that will actually be handed to a service at spawn time:
- * the active profile's override when there is one, else the service row's own value.
- * Mirrors buildEnvForService so the guard reasons about the same GPU the process gets.
+ * Returns the cudaDevice as REGISTERED for a service: the active profile's override
+ * when there is one, else the service row's own value. This is the configured value,
+ * not necessarily the card the process ends up on — see resolveGuardedCudaDevice.
  * @param serviceId - the service being inspected
  * @param fallback - the service row's cudaDevice
  */
-async function resolveEffectiveCudaDevice(serviceId: string, fallback: string | null): Promise<string | null> {
+async function resolveRegisteredCudaDevice(serviceId: string, fallback: string | null): Promise<string | null> {
   const active = await runProfileRepository.findActive()
   if (!active) return fallback
   const override = await runProfileRepository.findProfileService(active.id, serviceId)
   return override?.cudaDevice ?? fallback
+}
+
+/**
+ * Returns the GPU the service's process will ACTUALLY occupy: the pin its own start
+ * command hard-codes when it has one, else the registered value. Everything that
+ * reasons about GPUs — admission, occupancy, post-stop VRAM checks and what the UI
+ * displays — goes through this, so the guard can no longer reserve and police a
+ * different card from the one the job runs on (task-1493).
+ * @param service - the service row (needs id, cudaDevice, command)
+ */
+async function resolveEffectiveCudaDevice(service: { id: string; cudaDevice?: string | null; command?: string | null }): Promise<string | null> {
+  const registered = await resolveRegisteredCudaDevice(service.id, service.cudaDevice ?? null)
+  return resolveGuardedCudaDevice(registered, service.command)
 }
 
 /**
@@ -87,7 +103,7 @@ async function buildGpuOccupants(excludeServiceId: string): Promise<Map<number, 
   for (const svc of services) {
     if (svc.id === excludeServiceId) continue
     if (!processManager.isRunning(svc.id)) continue
-    const cudaDevice = await resolveEffectiveCudaDevice(svc.id, svc.cudaDevice ?? null)
+    const cudaDevice = await resolveEffectiveCudaDevice(svc)
     for (const index of parseCudaDevices(cudaDevice)) {
       const names = occupants.get(index) ?? []
       names.push(svc.name)
@@ -108,7 +124,14 @@ async function buildGpuOccupants(excludeServiceId: string): Promise<Map<number, 
  * @param service - the service row about to be started
  */
 async function assertVramAvailable(service: any): Promise<void> {
-  const cudaDevice = await resolveEffectiveCudaDevice(service.id, service.cudaDevice ?? null)
+  const registered = await resolveRegisteredCudaDevice(service.id, service.cudaDevice ?? null)
+  const conflict = describeCudaDeviceConflict(registered, service.command)
+  if (conflict) {
+    console.warn(`[gpuGuard] "${service.name}": ${conflict}`)
+    appendServiceNote(service.id, conflict)
+  }
+
+  const cudaDevice = resolveGuardedCudaDevice(registered, service.command)
   if (parseCudaDevices(cudaDevice).length === 0) return
   if (!service.minFreeVramMb) return
 
@@ -127,9 +150,46 @@ async function assertVramAvailable(service: any): Promise<void> {
 
   if (!verdict.allowed) {
     console.warn(`[gpuGuard] ${verdict.reason}`)
+    // The refusal has to land in the service's OWN output: the card just reads
+    // "stopped" and /output otherwise still shows the previous run's tail, which is
+    // exactly how a guard decision looked like a silent crash (task-1493).
+    appendServiceNote(service.id, `START REFUSED. ${verdict.reason}`)
     const err = new Error(verdict.reason)
     ;(err as any).statusCode = 409
     throw err
+  }
+}
+
+/**
+ * Checks the GPUs a service is pinned to for processes still holding VRAM, reaps the
+ * ones that are unambiguously its own orphans, and writes the outcome into that
+ * service's output. Run after a stop (so "stopped" means the card is actually free)
+ * and before a start (so admission is not refused because of the service's own
+ * leftover process). Never throws — a stop must still report the process it did kill
+ * even if the GPU probe fails.
+ * @param service - the service row being started or stopped
+ */
+async function sweepServiceGpuOrphans(service: any): Promise<string[]> {
+  try {
+    const cudaDevice = await resolveEffectiveCudaDevice(service)
+    const devices = parseCudaDevices(cudaDevice)
+    if (devices.length === 0) return []
+
+    const all = await serviceRepository.findAll()
+    const { notes } = await reapGpuSurvivors({
+      devices,
+      command: service.command,
+      ownerServiceId: service.id,
+      knownExecutables: buildKnownExecutables(all, service.name),
+    })
+    for (const note of notes) {
+      console.warn(`[gpuGuard] "${service.name}": ${note}`)
+      appendServiceNote(service.id, note)
+    }
+    return notes
+  } catch (err: any) {
+    console.warn(`[gpuGuard] post-stop VRAM sweep failed for "${service.name}":`, err?.message)
+    return []
   }
 }
 
@@ -159,15 +219,68 @@ async function checkPortUniqueness(port: number | null | undefined, excludeId?: 
   }
 }
 
+/**
+ * Merges a service row with its active-profile override and resolves the GPU it will
+ * really run on.
+ *
+ * `cudaDevice` is reported as the EFFECTIVE device — the command's own pin when it
+ * hard-codes one — so the list, the guard and the process can never show three
+ * different answers. `registeredCudaDevice` keeps the stored value visible, and
+ * `cudaDeviceConflict` carries the explanation whenever the two differ.
+ * @param service - the service row to merge
+ */
 async function mergeProfileOverride(service: any) {
   const active = await runProfileRepository.findActive()
-  if (!active) return { ...service, cudaDevice: null, startOnBoot: false }
-  const override = await runProfileRepository.findProfileService(active.id, service.id)
+  const override = active ? await runProfileRepository.findProfileService(active.id, service.id) : null
+  const registered = override?.cudaDevice ?? null
   return {
     ...service,
-    cudaDevice: override?.cudaDevice ?? null,
+    cudaDevice: resolveGuardedCudaDevice(registered, service.command),
+    registeredCudaDevice: registered,
+    cudaDeviceSource: extractCudaDevicesFromCommand(service.command) ? 'command' : 'profile',
+    cudaDeviceConflict: describeCudaDeviceConflict(registered, service.command),
     startOnBoot: override?.startOnBoot ?? false,
   }
+}
+
+/**
+ * Persists a cudaDevice change to the active profile's override row — the place the
+ * value actually lives since profiles were introduced.
+ *
+ * PUT /api/services/<id> used to drop `cudaDevice` on the floor: it answered 200 with
+ * the full service body while writing nothing, so a misregistration could not be
+ * corrected through the API at all and had to be patched in the store by hand
+ * (task-1493). A value that contradicts a device the command hard-codes is rejected
+ * rather than stored, so the two can never drift apart again.
+ * @param service - the service row being updated
+ * @param cudaDevice - the requested device string (null clears the pin)
+ */
+async function writeCudaDevice(service: any, cudaDevice: string | null): Promise<void> {
+  const value = cudaDevice === null || String(cudaDevice).trim() === '' ? null : String(cudaDevice).trim()
+
+  if (value !== null && parseCudaDevices(value).length === 0) {
+    const err = new Error(`cudaDevice must be a GPU index or comma-separated mask (e.g. "1" or "0,1"), got "${cudaDevice}"`)
+    ;(err as any).statusCode = 400
+    throw err
+  }
+
+  const commandPin = extractCudaDevicesFromCommand(service.command)
+  if (value !== null && commandPin && parseCudaDevices(commandPin).join(',') !== parseCudaDevices(value).join(',')) {
+    const err = new Error(
+      `Cannot set cudaDevice to "${value}": the start command hard-codes GPU "${commandPin}". ` +
+      `Change the command (or make it use %CUDA_DEVICE%) so the registration and the process agree.`
+    )
+    ;(err as any).statusCode = 409
+    throw err
+  }
+
+  const active = await runProfileRepository.findActive()
+  if (!active) {
+    const err = new Error('No active run profile — cudaDevice is stored per profile.')
+    ;(err as any).statusCode = 409
+    throw err
+  }
+  await runProfileRepository.upsertProfileService(active.id, service.id, { cudaDevice: value })
 }
 
 export const serviceService = {
@@ -224,17 +337,14 @@ export const serviceService = {
     await checkPortUniqueness(input.port)
     const service = await serviceRepository.create(input)
 
-    const active = await runProfileRepository.findActive()
     await runProfileRepository.createProfileServicesForAllProfiles(service.id, {
       cudaDevice: input.cudaDevice ?? null,
       startOnBoot: input.startOnBoot ?? false,
     })
 
-    if (active) {
-      const override = await runProfileRepository.findProfileService(active.id, service.id)
-      return { ...service, cudaDevice: override?.cudaDevice ?? null, startOnBoot: override?.startOnBoot ?? false }
-    }
-    return service
+    // Same merge as list/get, so a freshly created service reports the same effective
+    // cudaDevice (and any command conflict) as it will on the next read.
+    return mergeProfileOverride(service)
   },
 
   async updateService(id: string, input: UpdateServiceInput) {
@@ -252,8 +362,16 @@ export const serviceService = {
     const currentStatus = mem?.status || current.status
     const currentPid = mem?.pid ?? current.pid ?? null
 
+    // cudaDevice lives on the profile-override row, not the service row — split it
+    // out before the service update so Prisma never sees an unknown column and the
+    // value is actually persisted somewhere.
+    const { cudaDevice, ...serviceFields } = input as UpdateServiceInput & { cudaDevice?: string | null }
+    if (cudaDevice !== undefined) {
+      await writeCudaDevice({ ...current, ...serviceFields }, cudaDevice ?? null)
+    }
+
     const updated = await serviceRepository.update(id, {
-      ...input,
+      ...serviceFields,
       status: currentStatus,
       pid: currentPid,
     })
@@ -278,7 +396,16 @@ export const serviceService = {
       throw err
     }
 
-    await assertVramAvailable(service)
+    // A service that is already running releases its own VRAM as part of the
+    // restart this start performs, so the net change is ~zero — guarding it would
+    // only refuse the service its own card. Matches restartService.
+    if (!processManager.isRunning(id)) {
+      // Reap the service's own leftover GPU processes first: an orphan of a previous
+      // run holding the card would otherwise make admission refuse the very service
+      // that owns it.
+      await sweepServiceGpuOrphans(service)
+      await assertVramAvailable(service)
+    }
     await freePortForService(service)
 
     const env = await buildEnvForService(id, service.port)
@@ -317,11 +444,17 @@ export const serviceService = {
       await killPort(service.port, killOpts)
     }
 
+    // "Stopped" must mean the card is free. Killing the port holder is not the same
+    // as freeing the VRAM — an orphaned llama-server.exe survived both and kept 30 GB
+    // while the API reported success (task-1493).
+    const vramNotes = await sweepServiceGpuOrphans(service)
+
     const mem = processManager.getStatus(id)
     return {
       id,
       status: mem?.status || 'stopped',
       pid: mem?.pid ?? null,
+      ...(vramNotes.length > 0 && { vramNotes }),
     }
   },
 
@@ -337,7 +470,10 @@ export const serviceService = {
     // A service already running on the GPU releases its own VRAM as part of the
     // restart, so the net change is ~zero — guarding it would only false-positive.
     // A restart of a STOPPED service is a real stopped→running transition.
-    if (!processManager.isRunning(id)) await assertVramAvailable(service)
+    if (!processManager.isRunning(id)) {
+      await sweepServiceGpuOrphans(service)
+      await assertVramAvailable(service)
+    }
     await freePortForService(service)
 
     const env = await buildEnvForService(id, service.port)

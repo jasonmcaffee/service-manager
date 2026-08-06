@@ -92,6 +92,36 @@ To have Service Manager start automatically when Windows boots:
 
 Toggle the "Auto-start" badge on any service card to configure whether it starts automatically when Service Manager launches.
 
+### GPU pinning and the VRAM guard
+
+A service can declare which GPU it uses (`cudaDevice`, e.g. `1` or the dual-GPU mask `0,1`) and how
+much free VRAM it needs to start (`minFreeVramMb`). Before a stopped service is started, Service
+Manager reads `nvidia-smi` and refuses the start with a 409 if the card does not have
+`minFreeVramMb` + 512 MB free, naming the service that is holding it. The guard fails **open** —
+no pin, no requirement, or no `nvidia-smi` means the service starts as before.
+
+**The start command is the source of truth for which GPU a service runs on.** If a command
+hard-codes a device — `CUDA_VISIBLE_DEVICES=1`, `--cuda-device 0`, or llama.cpp's `-dev cuda1` —
+that pin wins over the registered `cudaDevice`, because it is the card the process actually gets.
+Comment lines (`REM`, `::`, `#`) are ignored, and a value that expands a variable
+(`CUDA_VISIBLE_DEVICES=%CUDA_DEVICE%`, the pattern ComfyUI uses) is *not* a hard-code — it defers to
+the registration, which Service Manager injects as `CUDA_DEVICE`.
+
+Because of that, writing a `cudaDevice` that contradicts a hard-coded pin is rejected with a 409 on
+both `PUT /api/services/[id]` and `PUT /api/profiles/[id]/services/[serviceId]`; the two can never
+disagree. Services read back `cudaDevice` (effective), `registeredCudaDevice` (stored),
+`cudaDeviceSource` (`command` or `profile`) and `cudaDeviceConflict`.
+
+Stopping, starting or `kill-port`-ing a GPU-pinned service also sweeps its cards for processes still
+holding VRAM. A leftover process is killed only when its executable is named in that service's own
+start command, is specific enough to identify (never a bare `python.exe`/`node.exe`), and is not a
+protected PID; anything else that belongs to another registered service is reported, never killed.
+Per-process VRAM is unavailable on Windows WDDM, so the report quotes the card's free-memory reading.
+
+Every guard decision — a refused start, a registration/command conflict, a stop performed by a
+profile switch, a service the reconciler found dead — is appended to that service's own output, so
+the reason is visible where you would look rather than only in the Service Manager console.
+
 ## Project Structure
 
 ```

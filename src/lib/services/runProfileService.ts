@@ -5,6 +5,8 @@ import { initializeIfNeeded, ensureDefaultProfile } from '@/lib/services/init'
 import { serviceService } from '@/lib/services/serviceService'
 import { diffProfiles, EffectiveConfig, DiffAction } from '@/lib/services/profileDiff'
 import { isProtectedServiceName } from '@/lib/util/processGuard'
+import { appendServiceNote } from '@/lib/util/logTailer'
+import { extractCudaDevicesFromCommand, parseCudaDevices } from '@/lib/util/gpuGuard'
 
 /**
  * Builds an EffectiveConfig array for every service under the given profile.
@@ -46,9 +48,16 @@ async function buildProtectedServiceIds(): Promise<Set<string>> {
  * @param serviceId - the service to act on
  * @param action - the diff action to apply ('start' | 'stop' | 'restart')
  */
-async function applyProfileAction(serviceId: string, action: DiffAction): Promise<{ id: string; name: string; status: string; error?: string } | null> {
+async function applyProfileAction(serviceId: string, action: DiffAction, profileName?: string): Promise<{ id: string; name: string; status: string; error?: string } | null> {
   const service = await serviceRepository.findById(serviceId)
   if (!service) return null
+
+  // A profile switch is the other way a service "just stops" with nothing in its
+  // output to say why, so the reason is written where someone would look (task-1493).
+  const because = profileName ? ` (switching to profile "${profileName}")` : ''
+  if (action !== 'noop') {
+    appendServiceNote(serviceId, `Profile switch: performing ${action}${because}.`)
+  }
 
   try {
     if (action === 'stop') {
@@ -168,7 +177,7 @@ export const runProfileService = {
     ordered.sort(([, a], [, b]) => (a === 'stop' ? 0 : 1) - (b === 'stop' ? 0 : 1))
 
     for (const [serviceId, action] of ordered) {
-      const result = await applyProfileAction(serviceId, action)
+      const result = await applyProfileAction(serviceId, action, profile.name)
       if (result) results.push(result)
     }
 
@@ -184,7 +193,29 @@ export const runProfileService = {
     return runProfileRepository.rename(id, name.trim())
   },
 
+  /**
+   * Writes a profile's per-service override. A cudaDevice that contradicts a device
+   * the service's start command hard-codes is rejected here as well as on the
+   * service endpoint, so there is no path that can store a pin the process will not
+   * honour (task-1493).
+   * @param profileId - profile owning the override
+   * @param serviceId - service being overridden
+   * @param data - the cudaDevice / startOnBoot values to write
+   */
   async upsertServiceOverride(profileId: string, serviceId: string, data: UpsertProfileServiceInput) {
+    if (data.cudaDevice !== undefined && data.cudaDevice !== null && String(data.cudaDevice).trim() !== '') {
+      const service = await serviceRepository.findById(serviceId)
+      const commandPin = extractCudaDevicesFromCommand(service?.command)
+      const requested = String(data.cudaDevice).trim()
+      if (commandPin && parseCudaDevices(commandPin).join(',') !== parseCudaDevices(requested).join(',')) {
+        const err = new Error(
+          `Cannot set cudaDevice to "${requested}": the start command hard-codes GPU "${commandPin}". ` +
+          `Change the command (or make it use %CUDA_DEVICE%) so the registration and the process agree.`
+        )
+        ;(err as any).statusCode = 409
+        throw err
+      }
+    }
     return runProfileRepository.upsertProfileService(profileId, serviceId, data)
   },
 

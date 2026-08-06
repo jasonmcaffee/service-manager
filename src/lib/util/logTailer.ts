@@ -43,6 +43,36 @@ export function readLogFileCapped(logFile: string, maxBytes: number = MAX_LOG_BY
   return buf.toString('utf-8')
 }
 
+/**
+ * Appends a Service-Manager-authored line to a service's own log file so decisions
+ * the manager made ABOUT the service are visible in the place someone actually
+ * looks — the service's terminal output.
+ *
+ * Without this, a start the VRAM guard refused, a stop a profile switch performed,
+ * and a service the reconciler found dead all presented identically: the card just
+ * said "stopped" and /output still showed the previous run's tail, with the real
+ * reason living only in the Service Manager console (task-1493).
+ *
+ * Best-effort by design — a failed note must never break a start/stop path. The
+ * running tailer picks the line up on its next poll, and the file fallback serves
+ * it for services with no live tailer.
+ * @param serviceId - service whose log should carry the note
+ * @param message - the reason, written verbatim after the marker
+ */
+export function appendServiceNote(serviceId: string, message: string): void {
+  try {
+    const logFile = getLogFilePath(serviceId)
+    const stamp = new Date().toISOString()
+    const line = message
+      .split('\n')
+      .map(l => `[service-manager ${stamp}] ${l.trim()}`)
+      .join('\n')
+    fs.appendFileSync(logFile, `${line}\n`, 'utf-8')
+  } catch (err: any) {
+    console.warn(`[logTailer] could not append note for ${serviceId}:`, err?.message)
+  }
+}
+
 interface TailerEntry {
   interval: ReturnType<typeof setInterval>
   offset: number

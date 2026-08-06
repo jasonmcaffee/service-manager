@@ -20,7 +20,7 @@ export async function PUT(
 ) {
   try {
     const body = await request.json()
-    const { name, description, command, port, noPort, wsl, minFreeVramMb } = body
+    const { name, description, command, port, noPort, wsl, minFreeVramMb, cudaDevice } = body
 
     // Only include fields present in the request body so callers can patch a
     // single field (e.g. wsl=true) without triggering port-uniqueness checks
@@ -33,6 +33,10 @@ export async function PUT(
     if (noPort !== undefined) input.noPort = noPort
     if (wsl !== undefined) input.wsl = wsl
     if (minFreeVramMb !== undefined) input.minFreeVramMb = minFreeVramMb ?? null
+    // cudaDevice is stored on the active profile's override row; the service layer
+    // routes it there. Dropping it here is what made this endpoint answer 200 while
+    // silently discarding the field (task-1493).
+    if (cudaDevice !== undefined) input.cudaDevice = cudaDevice ?? null
 
     const service = await serviceService.updateService(params.id, input as any)
 

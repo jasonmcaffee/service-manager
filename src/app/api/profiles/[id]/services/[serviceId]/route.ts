@@ -14,6 +14,6 @@ export async function PUT(
     })
     return NextResponse.json(result)
   } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    return NextResponse.json({ error: error.message }, { status: error.statusCode ?? 500 })
   }
 }

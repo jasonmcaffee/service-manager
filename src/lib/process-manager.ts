@@ -2,7 +2,7 @@ import { ChildProcess, spawn } from 'child_process'
 import fs from 'fs'
 import { EventEmitter } from 'events'
 import { writeStartupScript } from '@/lib/util/batchWriter'
-import { logTailer, getLogFilePath } from '@/lib/util/logTailer'
+import { logTailer, getLogFilePath, appendServiceNote } from '@/lib/util/logTailer'
 import { killWslPids } from '@/lib/util/portHelper'
 import { setTrackedPidsProvider, snapshotProcessTable, buildProtectedPids } from '@/lib/util/processGuard'
 import { onShutdown, fireAllSync } from '@/lib/lifecycle'
@@ -33,6 +33,25 @@ function buildSpawnEnv(): NodeJS.ProcessEnv {
 
 export type ServiceStatus = 'running' | 'stopped' | 'starting' | 'error'
 export type AdoptionKind = 'windows' | 'wsl'
+
+/** Plain-English text for each terse health-probe reason, for the service's own log. */
+const UNHEALTHY_REASONS: Record<string, string> = {
+  'log-stale': 'its log file stopped being written to, so the process is treated as gone',
+  'port-not-bound': 'nothing is listening on its port any more — the process exited',
+  'pid-dead': 'the process it was adopted from is no longer alive',
+  'process-exited': 'the process Service Manager spawned exited',
+  'port-taken-by-other-pid': 'its port is now bound by a different process',
+  'port-claimed-by-other-service': 'another service in the active profile claimed its port first',
+  'pid-claimed-by-other-service': 'another service in the active profile claimed its process first',
+}
+
+/**
+ * Turns a health-probe reason code into a sentence a person can act on.
+ * @param reason - the terse reason recorded by the reconciler
+ */
+function describeUnhealthyReason(reason: string): string {
+  return UNHEALTHY_REASONS[reason] ?? reason
+}
 
 export interface ServiceProcess {
   id: string
@@ -318,12 +337,22 @@ class ProcessManager extends EventEmitter {
   /**
    * Marks a service as unhealthy (stopped) without trying to kill it.
    * Used by the reconciler when a health probe reveals the process is gone.
+   *
+   * The reason is also written into the service's own output: this is the single
+   * chokepoint where Service Manager decides a service is no longer running, and it
+   * used to leave nothing behind but a "stopped" badge, so a job that vanished was
+   * indistinguishable from one someone stopped on purpose (task-1493).
    * @param serviceId - service to mark
    * @param reason - reason for the status change (logged to console)
    */
   markUnhealthy(serviceId: string, reason: string): void {
     const proc = this.processes.get(serviceId)
     console.log(`[process-manager] ${serviceId} marked unhealthy: ${reason}`)
+    // Only a real running→stopped transition is worth a note; without this a second
+    // reconcile pass over an already-stopped service would repeat the same line.
+    if (proc?.status === 'running') {
+      appendServiceNote(serviceId, `Marked STOPPED by Service Manager: ${describeUnhealthyReason(reason)}`)
+    }
     if (proc) {
       proc.status = 'stopped'
       proc.process = null
