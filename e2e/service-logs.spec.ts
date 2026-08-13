@@ -19,8 +19,10 @@ import os from 'os'
 
 /** Creates a temporary test service via the API and returns its id + cleanup fn. */
 async function createTestService(request: APIRequestContext, name: string, command: string, port?: number | null) {
+  // Every config change needs a reason (task-1523) — creating and deleting a
+  // service included, so the fixtures carry one too.
   const res = await request.post('/api/services', {
-    data: { name, command, port: port ?? null },
+    data: { name, command, port: port ?? null, reason: `Creating the ${name} fixture for the service-logs e2e run` },
   })
   expect(res.ok()).toBeTruthy()
   const svc = await res.json()
@@ -29,7 +31,9 @@ async function createTestService(request: APIRequestContext, name: string, comma
     cleanup: async () => {
       // Stop first (ignore errors — service may already be stopped)
       await request.post(`/api/services/${svc.id}/control`, { data: { action: 'stop' } }).catch(() => {})
-      await request.delete(`/api/services/${svc.id}`).catch(() => {})
+      await request.delete(`/api/services/${svc.id}`, {
+        data: { reason: `Removing the ${name} fixture at the end of the service-logs e2e run` },
+      }).catch(() => {})
     },
   }
 }
