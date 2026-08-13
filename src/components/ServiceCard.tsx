@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Service } from '@/types/service'
 import { StatusBadge } from './StatusBadge'
 import { TerminalOutput } from './TerminalOutput'
+import { ReasonPrompt } from './ReasonPrompt'
 import { Settings, ChevronDown, ChevronUp, AlertTriangle } from 'lucide-react'
 
 interface ServiceCardProps {
@@ -16,9 +17,19 @@ interface ServiceCardProps {
   dragHandleProps?: Record<string, any>
 }
 
+/** A flag flip waiting on its reason before it is sent. */
+interface PendingToggle {
+  field: 'wsl' | 'noPort' | 'startOnBoot'
+  label: string
+  next: boolean
+}
+
 export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, onPatch, onEditClick, dragHandleProps }: ServiceCardProps) {
   const [output, setOutput] = useState<string[]>([])
   const [isLoading, setIsLoading] = useState(false)
+  const [pendingToggle, setPendingToggle] = useState<PendingToggle | null>(null)
+  const [toggleError, setToggleError] = useState<string | null>(null)
+  const [isTogglePending, setIsTogglePending] = useState(false)
 
   const fetchOutput = useCallback(async () => {
     try {
@@ -68,51 +79,34 @@ export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, 
     }
   }
 
-  const handleToggleStartOnBoot = async () => {
+  /**
+   * Sends the pending toggle with the reason the user just gave. A one-click flag flip
+   * is still a configuration change, so it takes the same route (and the same audit
+   * entry) as an edit in the settings modal.
+   * @param reason - why this flag is being flipped
+   */
+  const handleConfirmToggle = async (reason: string) => {
+    if (!pendingToggle) return
+    setIsTogglePending(true)
+    setToggleError(null)
     try {
       const res = await fetch(`/api/services/${service.id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...service, startOnBoot: !service.startOnBoot }),
+        body: JSON.stringify({ [pendingToggle.field]: pendingToggle.next, reason }),
       })
-      if (res.ok) {
-        const data = await res.json()
-        onUpdate(data)
+      if (!res.ok) {
+        setToggleError((await res.json().catch(() => null))?.error ?? 'Failed to update service')
+        return
       }
-    } catch (error) {
+      const data = await res.json()
+      onUpdate(data)
+      setPendingToggle(null)
+    } catch (error: any) {
       console.error('Failed to update service:', error)
-    }
-  }
-
-  const handleToggleWsl = async () => {
-    try {
-      const res = await fetch(`/api/services/${service.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...service, wsl: !service.wsl }),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        onUpdate(data)
-      }
-    } catch (error) {
-      console.error('Failed to update service:', error)
-    }
-  }
-
-  const handleToggleNoPort = async () => {
-    try {
-      const res = await fetch(`/api/services/${service.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...service, noPort: !service.noPort }),
-      })
-      if (res.ok) {
-        const data = await res.json()
-        onUpdate(data)
-      }
-    } catch (error) {
-      console.error('Failed to update service:', error)
+      setToggleError(error?.message ?? 'Failed to update service')
+    } finally {
+      setIsTogglePending(false)
     }
   }
 
@@ -202,7 +196,7 @@ export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, 
 
         <div className="flex items-center gap-1.5">
           <button
-            onClick={handleToggleWsl}
+            onClick={() => { setToggleError(null); setPendingToggle({ field: 'wsl', label: 'WSL mode', next: !service.wsl }) }}
             className={`px-2 py-1 rounded text-[10px] font-medium transition-all ${
               service.wsl
                 ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30'
@@ -213,7 +207,7 @@ export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, 
             WSL
           </button>
           <button
-            onClick={handleToggleNoPort}
+            onClick={() => { setToggleError(null); setPendingToggle({ field: 'noPort', label: 'No-port mode', next: !service.noPort }) }}
             className={`px-2 py-1 rounded text-[10px] font-medium transition-all ${
               service.noPort
                 ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
@@ -224,7 +218,7 @@ export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, 
             No-port
           </button>
           <button
-            onClick={handleToggleStartOnBoot}
+            onClick={() => { setToggleError(null); setPendingToggle({ field: 'startOnBoot', label: 'Start on boot', next: !service.startOnBoot }) }}
             className={`px-2 py-1 rounded text-[10px] font-medium transition-all ${
               service.startOnBoot
                 ? 'bg-accent/20 text-accent border border-accent/30'
@@ -247,6 +241,17 @@ export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, 
           />
         </div>
       )}
+
+      <ReasonPrompt
+        isOpen={pendingToggle !== null}
+        title={`${pendingToggle?.next ? 'Enable' : 'Disable'} ${pendingToggle?.label ?? ''}`}
+        summary={`Changing "${service.name}" — ${pendingToggle?.label} ${pendingToggle?.next ? 'on' : 'off'}.`}
+        confirmLabel="Apply change"
+        error={toggleError}
+        isBusy={isTogglePending}
+        onCancel={() => setPendingToggle(null)}
+        onConfirm={handleConfirmToggle}
+      />
     </div>
   )
 }

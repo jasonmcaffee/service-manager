@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { X, Plus } from 'lucide-react'
+import { validateReason } from './ReasonPrompt'
 
 interface AddServiceModalProps {
   isOpen: boolean
@@ -18,13 +19,21 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
     port: '',
     cudaDevice: '',
   })
+  const [reason, setReason] = useState('')
+  const [submitError, setSubmitError] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!formData.name.trim() || !formData.command.trim()) return
+    const reasonProblem = validateReason(reason)
+    if (reasonProblem) {
+      setSubmitError(`A reason is required to register a service — ${reasonProblem}.`)
+      return
+    }
 
     setIsSubmitting(true)
+    setSubmitError(null)
     try {
       const res = await fetch('/api/services', {
         method: 'POST',
@@ -33,9 +42,10 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
           ...formData,
           port: formData.port ? parseInt(formData.port) : null,
           cudaDevice: formData.cudaDevice || null,
+          reason: reason.trim(),
         }),
       })
-      
+
       if (res.ok) {
         const service = await res.json()
         onAdd(service)
@@ -47,10 +57,14 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
           port: '',
           cudaDevice: '',
         })
+        setReason('')
         onClose()
+      } else {
+        setSubmitError((await res.json().catch(() => null))?.error ?? 'Failed to add service')
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to add service:', error)
+      setSubmitError(error?.message ?? 'Failed to add service')
     } finally {
       setIsSubmitting(false)
     }
@@ -152,14 +166,36 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
             </label>
           </div>
 
+          {/* Every configuration change carries its reasoning, registration included
+              — it becomes the first entry in the service's change log (task-1523). */}
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1.5">
+              Why are you adding this service? <span className="text-red-400">*</span>
+            </label>
+            <textarea
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              className="textarea-field w-full h-20 font-sans"
+              placeholder="e.g. Registering the second ComfyUI instance so the H3 batch can render on GPU 1"
+              required
+            />
+          </div>
+
+          {submitError && (
+            <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded px-3 py-2">
+              {submitError}
+            </p>
+          )}
+
           <div className="flex justify-end gap-3 pt-4 border-t border-zinc-800">
             <button type="button" onClick={onClose} className="btn-ghost">
               Cancel
             </button>
-            <button 
-              type="submit" 
-              disabled={isSubmitting || !formData.name.trim() || !formData.command.trim()}
-              className="btn-primary"
+            <button
+              type="submit"
+              disabled={isSubmitting || !formData.name.trim() || !formData.command.trim() || Boolean(validateReason(reason))}
+              className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed"
+              title={validateReason(reason) ?? undefined}
             >
               <Plus size={18} />
               {isSubmitting ? 'Adding...' : 'Add Service'}

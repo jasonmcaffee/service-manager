@@ -28,6 +28,37 @@ model Service {
   profileServices RunProfileService[]
 }
 
+/// An immutable record of one configuration change to a service (task-1523).
+/// Every create/update/delete/profile-override writes one of these, carrying the
+/// reason the change was made plus full before/after snapshots so any past config
+/// can be inspected and restored.
+model ConfigRevision {
+  id            String   @id @default(cuid())
+  /// Deliberately NOT a relation: a cascade would erase the record of a service
+  /// being deleted, which is exactly the history worth keeping.
+  serviceId     String
+  /// Denormalised so a revision still reads sensibly after a rename or delete.
+  serviceName   String
+  profileId     String?
+  profileName   String?
+  /// create | update | delete | revert | baseline
+  changeType    String
+  /// ui | agent | api — best-effort attribution taken from the request.
+  author        String   @default("ui")
+  reason        String
+  /// Effective config AFTER the change, JSON. Null for a delete.
+  snapshot      String?
+  /// Effective config BEFORE the change, JSON. Null for create/baseline.
+  previous      String?
+  /// [{ field, from, to }] computed at write time so the UI never re-diffs.
+  changedFields String   @default("[]")
+  /// Set when this revision was produced by reverting an earlier one.
+  revertedFromRevisionId String?
+  createdAt     DateTime @default(now())
+
+  @@index([serviceId, createdAt])
+}
+
 model RunProfile {
   id        String               @id @default(cuid())
   name      String

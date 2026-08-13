@@ -14,6 +14,9 @@ module.exports = {
     }],
   },
   testMatch: ['**/__tests__/**/*.test.ts'],
+  // Stubs the Prisma client for every suite so a service that quietly writes
+  // (e.g. the change-log recorder) can never touch the real database.
+  setupFiles: ['<rootDir>/src/__tests__/setup/mockPrisma.ts'],
   // Safety: always exit after tests complete to prevent leaked interval handles from blocking
   forceExit: true,
   // Warn when tests leave open handles (timers, sockets, etc.)

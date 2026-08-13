@@ -27,6 +27,48 @@ export interface Service {
   output?: string[]
 }
 
+/** The effective configuration of a service at a point in time (task-1523). */
+export interface ConfigSnapshot {
+  name: string
+  description: string | null
+  command: string
+  port: number | null
+  noPort: boolean
+  wsl: boolean
+  minFreeVramMb: number | null
+  /** Which profile the profile-scoped fields below were read from. */
+  profileId: string | null
+  profileName: string | null
+  cudaDevice: string | null
+  startOnBoot: boolean
+}
+
+/** One field that differed between two snapshots. */
+export interface ChangedField {
+  field: string
+  from: unknown
+  to: unknown
+}
+
+export type ConfigChangeType = 'create' | 'update' | 'delete' | 'revert' | 'baseline'
+
+/** An immutable record of one configuration change, as served to the UI. */
+export interface ConfigRevision {
+  id: string
+  serviceId: string
+  serviceName: string
+  profileId: string | null
+  profileName: string | null
+  changeType: ConfigChangeType
+  author: string
+  reason: string
+  snapshot: ConfigSnapshot | null
+  previous: ConfigSnapshot | null
+  changedFields: ChangedField[]
+  revertedFromRevisionId: string | null
+  createdAt: string
+}
+
 export interface RunProfileService {
   id: string
   profileId: string

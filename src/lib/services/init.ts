@@ -8,6 +8,7 @@ import {
 } from '@/lib/util/portHelper'
 import { getLogFilePath } from '@/lib/util/logTailer'
 import { reconciler } from '@/lib/services/reconciler'
+import { ensureBaselineRevisions } from '@/lib/services/configRevisionService'
 
 const globalForInit = globalThis as unknown as { smInitPromise?: Promise<void> }
 
@@ -353,6 +354,9 @@ export function initializeIfNeeded(): Promise<void> {
     globalForInit.smInitPromise = (async () => {
       await backfillKnownPorts()
       await ensureDefaultProfile()
+      // Give services that predate the change log a baseline revision, so the
+      // History tab is never empty and the first real change has a diff base.
+      await ensureBaselineRevisions()
       await adoptRunningServices()
       await adoptNoPortServices()
       // Launch flagged-but-stopped services. The boot guard is shared (via the

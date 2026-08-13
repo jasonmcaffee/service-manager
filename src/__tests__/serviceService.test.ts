@@ -227,31 +227,31 @@ describe('serviceService.startService', () => {
 
 describe('serviceService.createService', () => {
   it('rejects port below 1', async () => {
-    await expect(serviceService.createService({ name: 'x', command: 'echo', port: 0 }))
+    await expect(serviceService.createService({ name: 'x', command: 'echo', port: 0 }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' }))
       .rejects.toThrow('Port must be an integer between 1 and 65535')
   })
 
   it('rejects port above 65535', async () => {
-    await expect(serviceService.createService({ name: 'x', command: 'echo', port: 99999 }))
+    await expect(serviceService.createService({ name: 'x', command: 'echo', port: 99999 }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' }))
       .rejects.toThrow('Port must be an integer between 1 and 65535')
   })
 
   it('accepts null port', async () => {
     mockRepo.create.mockResolvedValue(makeService())
-    await expect(serviceService.createService({ name: 'x', command: 'echo', port: null }))
+    await expect(serviceService.createService({ name: 'x', command: 'echo', port: null }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' }))
       .resolves.toBeDefined()
   })
 
   it('accepts valid port', async () => {
     mockRepo.create.mockResolvedValue(makeService({ port: 8080 }))
-    await expect(serviceService.createService({ name: 'x', command: 'echo', port: 8080 }))
+    await expect(serviceService.createService({ name: 'x', command: 'echo', port: 8080 }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' }))
       .resolves.toBeDefined()
     expect(mockRepo.create).toHaveBeenCalledWith(expect.objectContaining({ port: 8080 }))
   })
 
   it('mirrors cudaDevice and startOnBoot to all profiles on service creation', async () => {
     mockRepo.create.mockResolvedValue(makeService())
-    await serviceService.createService({ name: 'x', command: 'echo', cudaDevice: '0', startOnBoot: true })
+    await serviceService.createService({ name: 'x', command: 'echo', cudaDevice: '0', startOnBoot: true }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
     expect(mockProfileRepo.createProfileServicesForAllProfiles).toHaveBeenCalledWith(
       'svc-1',
       { cudaDevice: '0', startOnBoot: true }
@@ -265,7 +265,7 @@ describe('serviceService.createService', () => {
     const { killPort, killMatchingProcesses } = require('@/lib/util/portHelper')
     mockRepo.create.mockResolvedValue(makeService({ port: 3000 }))
 
-    await serviceService.createService({ name: 'Local GitHub (Gitea)', command: 'call start-gitea.bat', port: 3000, startOnBoot: true })
+    await serviceService.createService({ name: 'Local GitHub (Gitea)', command: 'call start-gitea.bat', port: 3000, startOnBoot: true }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     expect(killPort).not.toHaveBeenCalled()
     expect(killMatchingProcesses).not.toHaveBeenCalled()

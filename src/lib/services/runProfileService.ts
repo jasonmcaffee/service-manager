@@ -7,6 +7,7 @@ import { diffProfiles, EffectiveConfig, DiffAction } from '@/lib/services/profil
 import { isProtectedServiceName } from '@/lib/util/processGuard'
 import { appendServiceNote } from '@/lib/util/logTailer'
 import { extractCudaDevicesFromCommand, parseCudaDevices } from '@/lib/util/gpuGuard'
+import { ChangeProvenance, captureSnapshot, recordChange, requireReason } from '@/lib/services/configRevisionService'
 
 /**
  * Builds an EffectiveConfig array for every service under the given profile.
@@ -202,9 +203,12 @@ export const runProfileService = {
    * @param serviceId - service being overridden
    * @param data - the cudaDevice / startOnBoot values to write
    */
-  async upsertServiceOverride(profileId: string, serviceId: string, data: UpsertProfileServiceInput) {
+  async upsertServiceOverride(profileId: string, serviceId: string, data: UpsertProfileServiceInput, change: ChangeProvenance) {
+    const service = await serviceRepository.findById(serviceId)
+    const reason = requireReason(change?.reason, 'change profile settings for service', service?.name ?? serviceId)
+    const before = await captureSnapshot(serviceId, profileId)
+
     if (data.cudaDevice !== undefined && data.cudaDevice !== null && String(data.cudaDevice).trim() !== '') {
-      const service = await serviceRepository.findById(serviceId)
       const commandPin = extractCudaDevicesFromCommand(service?.command)
       const requested = String(data.cudaDevice).trim()
       if (commandPin && parseCudaDevices(commandPin).join(',') !== parseCudaDevices(requested).join(',')) {
@@ -216,7 +220,20 @@ export const runProfileService = {
         throw err
       }
     }
-    return runProfileRepository.upsertProfileService(profileId, serviceId, data)
+
+    const result = await runProfileRepository.upsertProfileService(profileId, serviceId, data)
+
+    await recordChange({
+      serviceId,
+      serviceName: service?.name ?? serviceId,
+      changeType: change.changeType ?? 'update',
+      provenance: { ...change, reason },
+      previous: before,
+      snapshot: await captureSnapshot(serviceId, profileId),
+      revertedFromRevisionId: change.revertedFromRevisionId ?? null,
+    })
+
+    return result
   },
 
   async getServiceOverride(profileId: string, serviceId: string) {

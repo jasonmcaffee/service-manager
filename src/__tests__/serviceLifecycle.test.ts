@@ -66,13 +66,17 @@ jest.mock('@/lib/repositories/serviceRepository', () => ({
   },
 }))
 
+const mockFindActiveProfile = jest.fn(async () => null as any)
+const mockUpsertProfileService = jest.fn(async () => ({}))
+
 jest.mock('@/lib/repositories/runProfileRepository', () => ({
   runProfileRepository: {
-    findActive: jest.fn(async () => null),
+    findActive: mockFindActiveProfile,
     findAutoStartServices: jest.fn(async () => []),
     findProfileService: jest.fn(async () => null),
     count: jest.fn(async () => 1),
     createProfileServicesForAllProfiles: jest.fn(async () => {}),
+    upsertProfileService: mockUpsertProfileService,
   },
 }))
 
@@ -294,7 +298,7 @@ describe('serviceService.updateService — does NOT stop running services', () =
     mockFindById.mockResolvedValue(svc)
     mockGetStatus.mockReturnValue({ status: 'running', pid: 1234 })
 
-    const result = await serviceService.updateService('test-svc-id', { name: 'Renamed' })
+    const result = await serviceService.updateService('test-svc-id', { name: 'Renamed' }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     // Running status is preserved from processManager
     expect(result.status).toBe('running')
@@ -308,11 +312,16 @@ describe('serviceService.updateService — does NOT stop running services', () =
     const svc = makeService({ status: 'running', pid: 555 })
     mockFindById.mockResolvedValue(svc)
     mockGetStatus.mockReturnValue({ status: 'running', pid: 555 })
+    // startOnBoot is a profile-scoped field, so the write needs an active profile
+    // to land on (task-1523); the rest of this suite runs profile-less.
+    mockFindActiveProfile.mockResolvedValue({ id: 'profile-1', name: 'Default', isActive: true, services: [] } as any)
 
-    const result = await serviceService.updateService('test-svc-id', { startOnBoot: false } as any)
+    const result = await serviceService.updateService('test-svc-id', { startOnBoot: false } as any, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     expect(result.status).toBe('running')
     expect(mockStopService).not.toHaveBeenCalled()
+    expect(mockUpsertProfileService).toHaveBeenCalledWith('profile-1', 'test-svc-id', { startOnBoot: false })
+    mockFindActiveProfile.mockResolvedValue(null as any)
   })
 
   it('preserves status=running when updating the command', async () => {
@@ -320,7 +329,7 @@ describe('serviceService.updateService — does NOT stop running services', () =
     mockFindById.mockResolvedValue(svc)
     mockGetStatus.mockReturnValue({ status: 'running', pid: 999 })
 
-    const result = await serviceService.updateService('test-svc-id', { command: 'npm run prod' })
+    const result = await serviceService.updateService('test-svc-id', { command: 'npm run prod' }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     expect(result.status).toBe('running')
     expect(mockStopService).not.toHaveBeenCalled()
@@ -331,7 +340,7 @@ describe('serviceService.updateService — does NOT stop running services', () =
     mockFindById.mockResolvedValue(svc)
 
     await expect(
-      serviceService.updateService('test-svc-id', { port: 99999 })
+      serviceService.updateService('test-svc-id', { port: 99999 }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
     ).rejects.toMatchObject({ statusCode: 400 })
   })
 
@@ -341,7 +350,7 @@ describe('serviceService.updateService — does NOT stop running services', () =
     mockFindByPort.mockResolvedValue([{ id: 'other-svc', name: 'Other' }])
 
     await expect(
-      serviceService.updateService('test-svc-id', { port: 8080 })
+      serviceService.updateService('test-svc-id', { port: 8080 }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
     ).rejects.toMatchObject({ statusCode: 409 })
   })
 
@@ -349,7 +358,7 @@ describe('serviceService.updateService — does NOT stop running services', () =
     mockFindById.mockResolvedValue(null)
 
     await expect(
-      serviceService.updateService('missing', { name: 'X' })
+      serviceService.updateService('missing', { name: 'X' }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
     ).rejects.toMatchObject({ statusCode: 404 })
   })
 })
@@ -359,7 +368,7 @@ describe('serviceService.deleteService', () => {
   it('stops the service before deleting when it is running', async () => {
     mockIsRunning.mockReturnValue(true)
 
-    await serviceService.deleteService('test-svc-id')
+    await serviceService.deleteService('test-svc-id', { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     expect(mockStopService).toHaveBeenCalledWith('test-svc-id')
     expect(mockDelete).toHaveBeenCalledWith('test-svc-id')
@@ -368,7 +377,7 @@ describe('serviceService.deleteService', () => {
   it('deletes without stopping when service is already stopped', async () => {
     mockIsRunning.mockReturnValue(false)
 
-    await serviceService.deleteService('test-svc-id')
+    await serviceService.deleteService('test-svc-id', { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     expect(mockStopService).not.toHaveBeenCalled()
     expect(mockDelete).toHaveBeenCalledWith('test-svc-id')
@@ -435,7 +444,7 @@ describe('serviceService.getService — log fallback after re-adoption', () => {
 describe('serviceService.createService', () => {
   it('validates port range on create', async () => {
     await expect(
-      serviceService.createService({ name: 'X', command: 'x', port: 0 } as any)
+      serviceService.createService({ name: 'X', command: 'x', port: 0 } as any, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
     ).rejects.toMatchObject({ statusCode: 400 })
   })
 
@@ -443,7 +452,7 @@ describe('serviceService.createService', () => {
     mockFindByPort.mockResolvedValue([{ id: 'other', name: 'Other' }])
 
     await expect(
-      serviceService.createService({ name: 'X', command: 'x', port: 8080 } as any)
+      serviceService.createService({ name: 'X', command: 'x', port: 8080 } as any, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
     ).rejects.toMatchObject({ statusCode: 409 })
   })
 })

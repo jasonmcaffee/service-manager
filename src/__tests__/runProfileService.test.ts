@@ -234,14 +234,14 @@ describe('runProfileService.upsertServiceOverride', () => {
       id: 'rps-1', profileId: 'profile-1', serviceId: 'svc-1', cudaDevice: '2', startOnBoot: false
     })
 
-    const result = await runProfileService.upsertServiceOverride('profile-1', 'svc-1', { cudaDevice: '2' })
+    const result = await runProfileService.upsertServiceOverride('profile-1', 'svc-1', { cudaDevice: '2' }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     expect(mockProfileRepo.upsertProfileService).toHaveBeenCalledWith('profile-1', 'svc-1', { cudaDevice: '2' })
     expect(result.cudaDevice).toBe('2')
   })
 
   it('does not affect other profiles when updating one profile', async () => {
-    await runProfileService.upsertServiceOverride('profile-1', 'svc-1', { cudaDevice: '0' })
+    await runProfileService.upsertServiceOverride('profile-1', 'svc-1', { cudaDevice: '0' }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
 
     expect(mockProfileRepo.upsertProfileService).toHaveBeenCalledTimes(1)
     expect(mockProfileRepo.upsertProfileService).toHaveBeenCalledWith(

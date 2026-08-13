@@ -1,8 +1,10 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { X, Save, Trash2 } from 'lucide-react'
+import { useState, useEffect, useCallback } from 'react'
+import { X, Save, Trash2, History, SlidersHorizontal } from 'lucide-react'
 import { Service } from '@/types/service'
+import { RevisionHistory } from './RevisionHistory'
+import { ReasonPrompt, validateReason } from './ReasonPrompt'
 
 interface EditServiceModalProps {
   service: Service | null
@@ -12,6 +14,8 @@ interface EditServiceModalProps {
   onSave: (service: Service) => void
   onDelete: (id: string) => void
 }
+
+type Tab = 'settings' | 'history'
 
 function FieldBadge({ type }: { type: 'global' | 'profile' }) {
   return (
@@ -34,30 +38,65 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
     port: '',
     cudaDevice: '',
   })
+  const [reason, setReason] = useState('')
+  const [tab, setTab] = useState<Tab>('settings')
   const [isSaving, setIsSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [isDeletePromptOpen, setIsDeletePromptOpen] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
 
   // A command that hard-codes CUDA_VISIBLE_DEVICES / --cuda-device owns the GPU
   // choice; the field is shown but not editable so the registration can never
   // disagree with the card the process actually gets (task-1493).
   const pinnedByCommand = service?.cudaDeviceSource === 'command'
 
+  /** Loads the form from a service row. Shared by open, and by a revert's reload. */
+  const applyService = useCallback((next: Service) => {
+    setFormData({
+      name: next.name,
+      description: next.description || '',
+      command: next.command,
+      startOnBoot: next.startOnBoot,
+      port: next.port ? String(next.port) : '',
+      cudaDevice: next.cudaDevice || '',
+    })
+  }, [])
+
   useEffect(() => {
-    if (service) {
-      setFormData({
-        name: service.name,
-        description: service.description || '',
-        command: service.command,
-        startOnBoot: service.startOnBoot,
-        port: service.port ? String(service.port) : '',
-        cudaDevice: service.cudaDevice || '',
-      })
+    if (service) applyService(service)
+  }, [service, applyService])
+
+  // The reason belongs to one specific change; it must never carry over to the next
+  // edit, so it is cleared whenever a different service is opened.
+  useEffect(() => {
+    setReason('')
+    setSaveError(null)
+    setTab('settings')
+  }, [service?.id])
+
+  /** Re-reads the service after a revert so the Settings tab shows the restored config. */
+  const reloadService = useCallback(async () => {
+    if (!service) return
+    try {
+      const res = await fetch(`/api/services/${service.id}`)
+      if (!res.ok) return
+      const fresh: Service = await res.json()
+      applyService(fresh)
+      onSave(fresh)
+    } catch {
+      // A failed reload only means the form is stale; the poll will correct it.
     }
-  }, [service])
+  }, [service, applyService, onSave])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!service || !formData.name.trim() || !formData.command.trim()) return
+    const reasonProblem = validateReason(reason)
+    if (reasonProblem) {
+      setSaveError(`A reason is required for this change — ${reasonProblem}.`)
+      return
+    }
 
     setIsSaving(true)
     setSaveError(null)
@@ -71,6 +110,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
           description: formData.description,
           command: formData.command,
           port: formData.port ? parseInt(formData.port) : null,
+          reason: reason.trim(),
         }),
       })
 
@@ -90,6 +130,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
           body: JSON.stringify({
             ...(pinnedByCommand ? {} : { cudaDevice: formData.cudaDevice || null }),
             startOnBoot: formData.startOnBoot,
+            reason: reason.trim(),
           }),
         })
         if (!profileRes.ok) {
@@ -112,22 +153,34 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
     }
   }
 
-  const handleDelete = async () => {
+  const handleDelete = async (deleteReason: string) => {
     if (!service) return
-    if (!confirm(`Are you sure you want to delete "${service.name}"?`)) return
-
+    setIsDeleting(true)
+    setDeleteError(null)
     try {
-      const res = await fetch(`/api/services/${service.id}`, { method: 'DELETE' })
-      if (res.ok) {
-        onDelete(service.id)
-        onClose()
+      const res = await fetch(`/api/services/${service.id}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: deleteReason }),
+      })
+      if (!res.ok) {
+        setDeleteError((await res.json().catch(() => null))?.error ?? 'Failed to delete service')
+        return
       }
-    } catch (error) {
+      setIsDeletePromptOpen(false)
+      onDelete(service.id)
+      onClose()
+    } catch (error: any) {
       console.error('Failed to delete service:', error)
+      setDeleteError(error?.message ?? 'Failed to delete service')
+    } finally {
+      setIsDeleting(false)
     }
   }
 
   if (!isOpen || !service) return null
+
+  const reasonProblem = validateReason(reason)
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -135,12 +188,38 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
 
       <div className="absolute inset-4 card p-6 animate-slide-up overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-xl font-semibold text-zinc-100">Edit Service</h2>
+          <h2 className="text-xl font-semibold text-zinc-100">{service.name} — Settings</h2>
           <button onClick={onClose} className="btn-ghost p-2">
             <X size={20} />
           </button>
         </div>
 
+        {/* Tabs */}
+        <div className="flex items-center gap-1 mb-5 border-b border-zinc-800">
+          <button
+            type="button"
+            onClick={() => setTab('settings')}
+            className={`flex items-center gap-1.5 px-3 py-2 text-sm border-b-2 -mb-px transition-colors ${
+              tab === 'settings' ? 'border-accent text-accent' : 'border-transparent text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            <SlidersHorizontal size={14} /> Configuration
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab('history')}
+            className={`flex items-center gap-1.5 px-3 py-2 text-sm border-b-2 -mb-px transition-colors ${
+              tab === 'history' ? 'border-accent text-accent' : 'border-transparent text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            <History size={14} /> Change log
+          </button>
+        </div>
+
+        {tab === 'history' ? (
+          <RevisionHistory serviceId={service.id} onReverted={reloadService} />
+        ) : (
+        <>
         {/* Legend */}
         <div className="flex items-center gap-3 mb-5 text-xs text-zinc-500">
           <span className="flex items-center gap-1">
@@ -191,7 +270,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
             <textarea
               value={formData.command}
               onChange={(e) => setFormData({ ...formData, command: e.target.value })}
-              className="textarea-field w-full h-[50vh]"
+              className="textarea-field w-full h-[35vh]"
               placeholder="echo Hello World"
               required
             />
@@ -249,6 +328,25 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
             </label>
           </div>
 
+          {/* Reasoning is required on every config change — it is recorded in the
+              change log alongside the before/after config (task-1523). */}
+          <div>
+            <label className="block text-sm text-zinc-400 mb-1.5">
+              Reason for this change <span className="text-red-400">*</span>
+            </label>
+            <textarea
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              className="textarea-field w-full h-20 font-sans"
+              placeholder="e.g. Raised the context size to 200k for the long-document workflow"
+              required
+            />
+            <p className="mt-1 text-xs text-zinc-500">
+              Saved to the <button type="button" className="text-accent hover:underline" onClick={() => setTab('history')}>change log</button> with
+              the full before/after config, so this edit can be reviewed and reverted later.
+            </p>
+          </div>
+
           {saveError && (
             <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded px-3 py-2">
               {saveError}
@@ -256,7 +354,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
           )}
 
           <div className="flex justify-between pt-4 border-t border-zinc-800">
-            <button type="button" onClick={handleDelete} className="btn-danger text-sm">
+            <button type="button" onClick={() => { setDeleteError(null); setIsDeletePromptOpen(true) }} className="btn-danger text-sm">
               <Trash2 size={16} />
               Delete Service
             </button>
@@ -266,8 +364,9 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
               </button>
               <button
                 type="submit"
-                disabled={isSaving || !formData.name.trim() || !formData.command.trim()}
-                className="btn-primary"
+                disabled={isSaving || !formData.name.trim() || !formData.command.trim() || Boolean(reasonProblem)}
+                className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed"
+                title={reasonProblem ? `Reason required — ${reasonProblem}` : undefined}
               >
                 <Save size={16} />
                 {isSaving ? 'Saving...' : 'Save Changes'}
@@ -275,7 +374,21 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
             </div>
           </div>
         </form>
+        </>
+        )}
       </div>
+
+      <ReasonPrompt
+        isOpen={isDeletePromptOpen}
+        title={`Delete "${service.name}"`}
+        summary="The service is stopped and removed. Its change log is kept, including this deletion and the configuration it had."
+        confirmLabel="Delete service"
+        danger
+        error={deleteError}
+        isBusy={isDeleting}
+        onCancel={() => setIsDeletePromptOpen(false)}
+        onConfirm={handleDelete}
+      />
     </div>
   )
 }

@@ -3,6 +3,10 @@ import { processManager, ServiceStatus } from '@/lib/process-manager'
 import { serviceRepository, CreateServiceInput, UpdateServiceInput } from '@/lib/repositories/serviceRepository'
 import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { initializeIfNeeded, startAutoStartServices } from '@/lib/services/init'
+import {
+  ChangeProvenance, RESTORABLE_FIELDS, captureSnapshot, getRevision, recordChange, requireReason,
+} from '@/lib/services/configRevisionService'
+import { ConfigSnapshot } from '@/types/service'
 import { killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy } from '@/lib/util/portHelper'
 import { getLogFilePath, readLogFileCapped, INITIAL_TAIL_BYTES, appendServiceNote } from '@/lib/util/logTailer'
 import {
@@ -193,6 +197,24 @@ async function sweepServiceGpuOrphans(service: any): Promise<string[]> {
   }
 }
 
+/**
+ * Turns a stored snapshot into an update payload. Only the restorable configuration
+ * fields are taken — runtime state (status, pid) and the snapshot's profile context
+ * are deliberately left out, so a revert restores configuration and nothing else.
+ * @param snapshot - the configuration captured by the revision being restored
+ */
+function buildRevertInput(snapshot: ConfigSnapshot): Record<string, unknown> {
+  const input: Record<string, unknown> = {}
+  for (const field of RESTORABLE_FIELDS) {
+    input[field] = (snapshot as any)[field] ?? null
+  }
+  // startOnBoot is a boolean flag; a null would read as "unset" downstream.
+  input.startOnBoot = Boolean(snapshot.startOnBoot)
+  input.noPort = Boolean(snapshot.noPort)
+  input.wsl = Boolean(snapshot.wsl)
+  return input
+}
+
 function validatePort(port: number | null | undefined) {
   if (port === undefined || port === null) return
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -283,6 +305,25 @@ async function writeCudaDevice(service: any, cudaDevice: string | null): Promise
   await runProfileRepository.upsertProfileService(active.id, service.id, { cudaDevice: value })
 }
 
+/**
+ * Persists a startOnBoot change to the active profile's override row, which is where
+ * the flag has actually lived since profiles were introduced. Writing it onto the
+ * service row (the legacy column) is what made the card's Auto-start toggle appear to
+ * do nothing: the write landed somewhere nothing reads, and the next poll re-rendered
+ * the profile's unchanged value.
+ * @param serviceId - the service being updated
+ * @param startOnBoot - the requested flag
+ */
+async function writeStartOnBoot(serviceId: string, startOnBoot: boolean): Promise<void> {
+  const active = await runProfileRepository.findActive()
+  if (!active) {
+    const err = new Error('No active run profile — startOnBoot is stored per profile.')
+    ;(err as any).statusCode = 409
+    throw err
+  }
+  await runProfileRepository.upsertProfileService(active.id, serviceId, { startOnBoot: Boolean(startOnBoot) })
+}
+
 export const serviceService = {
   async listServices() {
     await initializeIfNeeded()
@@ -332,7 +373,16 @@ export const serviceService = {
     }
   },
 
-  async createService(input: CreateServiceInput) {
+  /**
+   * Registers a new service. The change log's entry point for a create: the reason
+   * is validated before anything is written, so a service can never appear with no
+   * record of why it exists (task-1523).
+   * @param input - the service fields to register
+   * @param change - why this service is being added, and by whom
+   */
+  async createService(input: CreateServiceInput, change: ChangeProvenance) {
+    const reason = requireReason(change?.reason, 'create service', input.name ?? 'new service')
+
     validatePort(input.port)
     await checkPortUniqueness(input.port)
     const service = await serviceRepository.create(input)
@@ -342,18 +392,38 @@ export const serviceService = {
       startOnBoot: input.startOnBoot ?? false,
     })
 
+    await recordChange({
+      serviceId: service.id,
+      serviceName: service.name,
+      changeType: 'create',
+      provenance: { ...change, reason },
+      previous: null,
+      snapshot: await captureSnapshot(service.id),
+    })
+
     // Same merge as list/get, so a freshly created service reports the same effective
     // cudaDevice (and any command conflict) as it will on the next read.
     return mergeProfileOverride(service)
   },
 
-  async updateService(id: string, input: UpdateServiceInput) {
+  /**
+   * Applies a configuration change to a service and appends it to the change log.
+   * Snapshots are taken either side of the write so the recorded diff is what the
+   * database actually did, and an update that changes nothing records nothing.
+   * @param id - the service to update
+   * @param input - the fields to change
+   * @param change - why this configuration is changing, and by whom
+   */
+  async updateService(id: string, input: UpdateServiceInput, change: ChangeProvenance) {
     const current = await serviceRepository.findById(id)
     if (!current) {
       const err = new Error('Service not found')
       ;(err as any).statusCode = 404
       throw err
     }
+
+    const reason = requireReason(change?.reason, 'update service', current.name)
+    const before = await captureSnapshot(id)
 
     validatePort(input.port)
     await checkPortUniqueness(input.port, id)
@@ -362,12 +432,16 @@ export const serviceService = {
     const currentStatus = mem?.status || current.status
     const currentPid = mem?.pid ?? current.pid ?? null
 
-    // cudaDevice lives on the profile-override row, not the service row — split it
-    // out before the service update so Prisma never sees an unknown column and the
-    // value is actually persisted somewhere.
-    const { cudaDevice, ...serviceFields } = input as UpdateServiceInput & { cudaDevice?: string | null }
+    // cudaDevice and startOnBoot live on the profile-override row, not the service
+    // row — split them out before the service update so Prisma never sees an unknown
+    // column and the values are actually persisted where they are read from.
+    const { cudaDevice, startOnBoot, ...serviceFields } =
+      input as UpdateServiceInput & { cudaDevice?: string | null; startOnBoot?: boolean }
     if (cudaDevice !== undefined) {
       await writeCudaDevice({ ...current, ...serviceFields }, cudaDevice ?? null)
+    }
+    if (startOnBoot !== undefined) {
+      await writeStartOnBoot(id, Boolean(startOnBoot))
     }
 
     const updated = await serviceRepository.update(id, {
@@ -376,15 +450,98 @@ export const serviceService = {
       pid: currentPid,
     })
 
+    await recordChange({
+      serviceId: id,
+      serviceName: updated.name,
+      changeType: change.changeType ?? 'update',
+      provenance: { ...change, reason },
+      previous: before,
+      snapshot: await captureSnapshot(id),
+      revertedFromRevisionId: change.revertedFromRevisionId ?? null,
+    })
+
     const merged = await mergeProfileOverride(updated)
     return { ...merged, status: currentStatus, pid: currentPid }
   },
 
-  async deleteService(id: string) {
+  /**
+   * Removes a service, recording the removal and the configuration it had. The
+   * revision deliberately outlives the service row (no FK cascade) — the record of
+   * what was deleted is the part of the history worth keeping most.
+   * @param id - the service to delete
+   * @param change - why it is being removed, and by whom
+   */
+  async deleteService(id: string, change: ChangeProvenance) {
+    const current = await serviceRepository.findById(id)
+    const reason = requireReason(change?.reason, 'delete service', current?.name ?? id)
+    const before = await captureSnapshot(id)
+
     if (processManager.isRunning(id)) {
       await processManager.stopService(id)
     }
     await serviceRepository.delete(id)
+
+    await recordChange({
+      serviceId: id,
+      serviceName: current?.name ?? id,
+      changeType: 'delete',
+      provenance: { ...change, reason },
+      previous: before,
+      snapshot: null,
+    })
+  },
+
+  /**
+   * Restores the configuration captured by an earlier revision. A revert is a normal
+   * forward change: it goes through updateService so every validation still runs, and
+   * it appends its own `revert` revision rather than rewriting history.
+   *
+   * Profile-scoped fields land on the CURRENTLY ACTIVE profile. When the revision was
+   * captured under a different profile the response says so — applying only half the
+   * config silently would be worse than applying it with a warning.
+   * @param id - the service to restore
+   * @param revisionId - the revision whose snapshot to apply
+   * @param change - why we are reverting, and by whom
+   */
+  async revertToRevision(id: string, revisionId: string, change: ChangeProvenance) {
+    const current = await serviceRepository.findById(id)
+    if (!current) {
+      const err = new Error('Service not found')
+      ;(err as any).statusCode = 404
+      throw err
+    }
+
+    const reason = requireReason(change?.reason, 'revert service', current.name)
+    const revision = await getRevision(id, revisionId)
+    if (!revision) {
+      const err = new Error('Revision not found for this service')
+      ;(err as any).statusCode = 404
+      throw err
+    }
+    if (!revision.snapshot) {
+      const err = new Error('This revision has no configuration to restore (the service was deleted at that point).')
+      ;(err as any).statusCode = 409
+      throw err
+    }
+
+    const active = await runProfileRepository.findActive()
+    const crossProfile = Boolean(revision.profileId && active && revision.profileId !== active.id)
+
+    const service = await this.updateService(id, buildRevertInput(revision.snapshot) as any, {
+      reason,
+      author: change.author,
+      changeType: 'revert',
+      revertedFromRevisionId: revisionId,
+    })
+
+    return {
+      service,
+      revertedFrom: revisionId,
+      crossProfile,
+      warning: crossProfile
+        ? `Profile-scoped values (GPU pin, start-on-boot) came from profile "${revision.profileName}" and were applied to the active profile "${active?.name}".`
+        : null,
+    }
   },
 
   async startService(id: string) {
