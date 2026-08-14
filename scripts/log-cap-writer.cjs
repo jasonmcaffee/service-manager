@@ -63,10 +63,48 @@ function trimIfNeeded() {
   size = safeSize()
 }
 
+const NEWLINE = 0x0a
+/** True when the next byte written starts a fresh line and therefore wants a timestamp. */
+let atLineStart = true
+
+/**
+ * Prefixes each NEWLINE-started line with an ISO timestamp.
+ *
+ * Added for ai-service task-1533: a ComfyUI render died mid-generation and the only place a traceback
+ * could have landed was this file — which had no timestamps, so the exception could not be tied to the
+ * render that hung. An undateable log is the difference between knowing and guessing.
+ *
+ * It stamps on \n ONLY, never on \r. Progress bars (tqdm, and anything else that redraws a line) emit
+ * many carriage-returned updates per second; stamping those would multiply the file size, blow through
+ * the cap, and turn one readable progress line into hundreds. Tracebacks and ordinary log output are
+ * newline-delimited, so they get dated and the redrawing bars are left exactly as they were.
+ *
+ * Works on the Buffer rather than a decoded string so a service emitting non-UTF-8 bytes cannot be
+ * corrupted by a round-trip through JavaScript strings.
+ * @param chunk - the raw bytes read from the service's stdout/stderr
+ */
+function stampLines(chunk) {
+  if (!chunk.length) return chunk
+  const prefix = Buffer.from(`[${new Date().toISOString()}] `)
+  const parts = []
+  let start = 0
+  if (atLineStart) { parts.push(prefix); atLineStart = false }
+  for (let i = 0; i < chunk.length; i += 1) {
+    if (chunk[i] !== NEWLINE) continue
+    parts.push(chunk.subarray(start, i + 1))
+    start = i + 1
+    if (start < chunk.length) parts.push(prefix)
+    else atLineStart = true
+  }
+  if (start < chunk.length) parts.push(chunk.subarray(start))
+  return Buffer.concat(parts)
+}
+
 process.stdin.on('data', (chunk) => {
   try {
-    fs.writeSync(fd, chunk)
-    size += chunk.length
+    const stamped = stampLines(chunk)
+    fs.writeSync(fd, stamped)
+    size += stamped.length
   } catch {
     // ignore transient write failures; keep pumping
   }
