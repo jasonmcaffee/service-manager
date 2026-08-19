@@ -57,7 +57,7 @@ jest.mock('@/lib/lifecycle', () => ({
 }))
 
 jest.mock('@/lib/services/reconciler', () => ({
-  reconciler: { start: jest.fn(), stop: jest.fn(), tick: jest.fn(async () => {}) },
+  reconciler: { start: jest.fn(), stop: jest.fn(), tick: jest.fn(async () => {}), setServiceStarter: jest.fn() },
 }))
 
 // ── imports ───────────────────────────────────────────────────────────────────

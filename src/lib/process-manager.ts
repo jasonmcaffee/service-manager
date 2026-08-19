@@ -83,6 +83,11 @@ class ProcessManager extends EventEmitter {
   // orphaned the wrapper, accumulating duplicate service instances (task-609).
   private spawnedWrappers: Map<string, number> = new Map()
 
+  // Services Service Manager has just asked to stop. Read by the exit handler so the
+  // note it writes says whether the death was requested or not — the difference
+  // between "you stopped it" and "it died on you" is the whole point of the note.
+  private intentionalStops: Set<string> = new Set()
+
   static getInstance(): ProcessManager {
     const existing = globalForProcessManager.processManagerInstance
     // Replace a stale singleton after a hot-reload: the existing instance was
@@ -431,6 +436,24 @@ class ProcessManager extends EventEmitter {
       logTailer.start(serviceId, logFile, true)
 
       child.on('exit', async (code) => {
+        // Say so in the service's own log. Without this line a service that died left
+        // its log ending mid-air on its last normal output, with no timestamp and no
+        // exit code, so there was no way to tell a crash from an external kill after
+        // the fact — which is exactly what two dead public sites looked like in
+        // task-1593. A profile switch and a markUnhealthy both write a note; an
+        // ordinary exit, the most common death of all, wrote nothing.
+        const wasAsked = this.intentionalStops.delete(serviceId)
+        // Diagnostics must never be able to break the lifecycle cleanup below.
+        try {
+          appendServiceNote(
+            serviceId,
+            wasAsked
+              ? `Process exited with code ${code} after Service Manager asked it to stop.`
+              : `Process EXITED with code ${code}. Service Manager did NOT ask it to stop — it died on its own or was killed by something else.`,
+          )
+        } catch (err: any) {
+          console.warn(`[process-manager] could not note exit for ${serviceId}:`, err?.message)
+        }
         if (this.spawnedWrappers.get(serviceId) === child.pid) this.spawnedWrappers.delete(serviceId)
         const proc = this.processes.get(serviceId)
         if (proc) {
@@ -479,6 +502,12 @@ class ProcessManager extends EventEmitter {
   ): Promise<void> {
     const serviceProcess = this.processes.get(serviceId)
     const pid = serviceProcess?.process?.pid ?? serviceProcess?.pid
+
+    // Mark the death as requested before anything is killed, so the exit handler (which
+    // can fire immediately) reads a flag that is already set. Self-clearing, so a stop
+    // that never produces an exit event cannot mislabel a later, unrelated death.
+    this.intentionalStops.add(serviceId)
+    setTimeout(() => this.intentionalStops.delete(serviceId), 30_000).unref?.()
 
     if (!pid) {
       if (serviceProcess) {

@@ -10,6 +10,9 @@ export async function GET(
     const status = serviceService.getProcessStatus(params.id)
     return NextResponse.json({
       output,
+      // Survives the truncation every start performs on the run log, so the card can
+      // still say why the previous run ended (task-1593).
+      events: serviceService.getEvents(params.id, 12),
       status: status?.status || 'stopped',
       pid: status?.pid,
     })

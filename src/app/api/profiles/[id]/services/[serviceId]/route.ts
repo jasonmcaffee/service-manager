@@ -8,12 +8,13 @@ export async function PUT(
 ) {
   try {
     const body = await request.json()
-    const { cudaDevice, startOnBoot } = body
+    const { cudaDevice, startOnBoot, autoRestart } = body
     const { reason, author } = extractChangeContext(request, body)
 
     const result = await runProfileService.upsertServiceOverride(params.id, params.serviceId, {
       cudaDevice: cudaDevice !== undefined ? cudaDevice : undefined,
       startOnBoot: startOnBoot !== undefined ? startOnBoot : undefined,
+      autoRestart: autoRestart !== undefined ? autoRestart : undefined,
     }, { reason: reason ?? '', author })
     return NextResponse.json(result)
   } catch (error: any) {

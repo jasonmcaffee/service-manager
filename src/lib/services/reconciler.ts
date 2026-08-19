@@ -5,6 +5,7 @@ import { runProfileRepository } from '@/lib/repositories/runProfileRepository'
 import { snapshotWindowsListeners, snapshotWslListeners, isWslProxyPid } from '@/lib/util/portHelper'
 import { getLogFilePath } from '@/lib/util/logTailer'
 import { onShutdown } from '@/lib/lifecycle'
+import { considerRestart, loadAutoRestartServiceIds, noteServiceRunning } from '@/lib/services/autoRestartSupervisor'
 
 const TICK_INTERVAL_MS = 10_000
 
@@ -29,6 +30,21 @@ async function rankByAutostartPriority(services: any[], activeProfileId: string 
 
 class Reconciler {
   private interval: ReturnType<typeof setInterval> | undefined
+
+  /**
+   * Performs a guarded start, exactly as the Start button does. Injected by init
+   * rather than imported, because serviceService reaches back into init and a static
+   * import here would close the cycle. Unset = auto-restart stays dormant.
+   */
+  private serviceStarter: ((id: string) => Promise<unknown>) | undefined
+
+  /**
+   * Registers the function auto-restart uses to bring a service back.
+   * @param starter - performs a full guarded start for a service id
+   */
+  setServiceStarter(starter: (id: string) => Promise<unknown>): void {
+    this.serviceStarter = starter
+  }
 
   static getInstance(): Reconciler {
     if (!globalForReconciler.reconcilerInstance || !(globalForReconciler.reconcilerInstance instanceof Reconciler)) {
@@ -83,6 +99,10 @@ class Reconciler {
       const active = await runProfileRepository.findActive()
       const ranked = await rankByAutostartPriority(services, active?.id)
 
+      // Read once per tick rather than per service — it is one query either way, and
+      // every service in this loop is judged against the same profile.
+      const autoRestartIds = await loadAutoRestartServiceIds()
+
       // Per-tick claim tracking: prevents two services that share a port from
       // both adopting the same PID. Autostart services rank first, so the
       // intended owner wins. Matches the logic in init's adoptRunningServices.
@@ -99,6 +119,7 @@ class Reconciler {
           } else {
             await this.reconcileNoPortService(svc)
           }
+          await this.superviseAutoRestart(svc, autoRestartIds)
         } catch (err: any) {
           console.error(`[reconciler] "${svc.name}" reconcile failed (continuing):`, err?.message ?? err)
         }
@@ -106,6 +127,29 @@ class Reconciler {
     } catch (err) {
       console.error('[reconciler] tick error:', err)
     }
+  }
+
+  /**
+   * Acts on what the reconcile pass just established. The pass above is still
+   * strictly one-way (OS → DB); this is the single place the manager is allowed to
+   * push back, and only for a service that was explicitly opted into auto-restart.
+   *
+   * Runs after reconcileFromOS/reconcileNoPortService so it reads settled state
+   * rather than the pre-tick row.
+   * @param svc - the service row as loaded at the top of this tick
+   * @param autoRestartIds - services the active profile opted into auto-restart
+   */
+  async superviseAutoRestart(svc: any, autoRestartIds: Set<string>): Promise<void> {
+    // Dormant until init hands us a starter, which it does only after boot autostart
+    // has finished walking the same list — so a tick can never start a service out
+    // from under the boot sequence.
+    if (!this.serviceStarter) return
+
+    if (processManager.isRunning(svc.id)) {
+      await noteServiceRunning(svc.id, svc.desiredStatus ?? 'stopped')
+      return
+    }
+    await considerRestart(svc, autoRestartIds.has(svc.id), this.serviceStarter)
   }
 
   /**

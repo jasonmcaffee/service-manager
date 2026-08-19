@@ -40,6 +40,7 @@ const mockRepo = {
   findByName: jest.fn(async () => null),
   getPort: jest.fn(async () => null),
   findByPort: jest.fn(async () => []),
+  setDesiredStatus: jest.fn(async () => undefined),
 }
 
 jest.mock('@/lib/repositories/serviceRepository', () => ({
@@ -249,12 +250,12 @@ describe('serviceService.createService', () => {
     expect(mockRepo.create).toHaveBeenCalledWith(expect.objectContaining({ port: 8080 }))
   })
 
-  it('mirrors cudaDevice and startOnBoot to all profiles on service creation', async () => {
+  it('mirrors cudaDevice, startOnBoot and autoRestart to all profiles on service creation', async () => {
     mockRepo.create.mockResolvedValue(makeService())
-    await serviceService.createService({ name: 'x', command: 'echo', cudaDevice: '0', startOnBoot: true }, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
+    await serviceService.createService({ name: 'x', command: 'echo', cudaDevice: '0', startOnBoot: true, autoRestart: true } as any, { reason: 'Test change: exercising this path with a recorded reason', author: 'api' })
     expect(mockProfileRepo.createProfileServicesForAllProfiles).toHaveBeenCalledWith(
       'svc-1',
-      { cudaDevice: '0', startOnBoot: true }
+      { cudaDevice: '0', startOnBoot: true, autoRestart: true }
     )
   })
 

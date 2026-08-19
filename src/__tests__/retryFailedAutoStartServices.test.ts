@@ -28,6 +28,7 @@ jest.mock('@/lib/repositories/serviceRepository', () => ({
     update: mockUpdate,
     findAll: jest.fn(async () => []),
     findByName: jest.fn(async () => null),
+    setDesiredStatus: jest.fn(async () => undefined),
   },
 }))
 
@@ -60,7 +61,7 @@ jest.mock('@/lib/util/logTailer', () => ({
 }))
 
 jest.mock('@/lib/services/reconciler', () => ({
-  reconciler: { start: jest.fn() },
+  reconciler: { start: jest.fn(), setServiceStarter: jest.fn() },
 }))
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -121,6 +122,23 @@ describe('retryFailedAutoStartServices', () => {
 
     expect(mockStartService).not.toHaveBeenCalled()
     expect(mockKillPort).not.toHaveBeenCalled()
+  })
+
+  // task-1593: this sweep runs for a few minutes after every manager boot, and it used
+  // to restart anything flagged start-on-boot that was not running — including a service
+  // somebody had deliberately stopped in that window, silently undoing the Stop.
+  it('leaves a deliberately-stopped service alone instead of undoing the Stop', async () => {
+    mockFindAutoStart.mockResolvedValue([
+      makeEntry('svc-media', 'Media Site', { port: 3300, desiredStatus: 'stopped' }),
+      makeEntry('svc-llama', 'Llama.cpp Server', { port: 8080, desiredStatus: 'running' }),
+    ])
+    mockIsRunning.mockReturnValue(false)
+
+    await retryFailedAutoStartServices(1)
+
+    expect(mockStartService).toHaveBeenCalledTimes(1)
+    expect(mockStartService).toHaveBeenCalledWith('svc-llama', expect.anything(), expect.anything(), expect.any(Function))
+    expect(mockKillPort).not.toHaveBeenCalledWith(3300, expect.anything())
   })
 
   it('is a no-op when there is no active profile', async () => {

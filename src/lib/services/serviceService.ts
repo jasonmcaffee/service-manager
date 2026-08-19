@@ -8,7 +8,7 @@ import {
 } from '@/lib/services/configRevisionService'
 import { ConfigSnapshot } from '@/types/service'
 import { killPort, killMatchingProcesses, extractServiceDir, ensureWslPortProxy } from '@/lib/util/portHelper'
-import { getLogFilePath, readLogFileCapped, INITIAL_TAIL_BYTES, appendServiceNote } from '@/lib/util/logTailer'
+import { getLogFilePath, readLogFileCapped, INITIAL_TAIL_BYTES, appendServiceNote, readServiceEvents } from '@/lib/util/logTailer'
 import {
   checkVramAdmission, parseCudaDevices, queryGpuMemory, resolveGuardedCudaDevice,
   describeCudaDeviceConflict, extractCudaDevicesFromCommand, reapGpuSurvivors, buildKnownExecutables,
@@ -210,6 +210,7 @@ function buildRevertInput(snapshot: ConfigSnapshot): Record<string, unknown> {
   }
   // startOnBoot is a boolean flag; a null would read as "unset" downstream.
   input.startOnBoot = Boolean(snapshot.startOnBoot)
+  input.autoRestart = Boolean(snapshot.autoRestart)
   input.noPort = Boolean(snapshot.noPort)
   input.wsl = Boolean(snapshot.wsl)
   return input
@@ -262,6 +263,7 @@ async function mergeProfileOverride(service: any) {
     cudaDeviceSource: extractCudaDevicesFromCommand(service.command) ? 'command' : 'profile',
     cudaDeviceConflict: describeCudaDeviceConflict(registered, service.command),
     startOnBoot: override?.startOnBoot ?? false,
+    autoRestart: override?.autoRestart ?? false,
   }
 }
 
@@ -322,6 +324,24 @@ async function writeStartOnBoot(serviceId: string, startOnBoot: boolean): Promis
     throw err
   }
   await runProfileRepository.upsertProfileService(active.id, serviceId, { startOnBoot: Boolean(startOnBoot) })
+}
+
+/**
+ * Persists an autoRestart change to the active profile's override row. Stored beside
+ * startOnBoot rather than on the service row, because it is the same kind of statement:
+ * "this profile wants this service up". startOnBoot says it at boot, autoRestart keeps
+ * saying it for as long as the profile is active (task-1593).
+ * @param serviceId - the service being updated
+ * @param autoRestart - the requested flag
+ */
+async function writeAutoRestart(serviceId: string, autoRestart: boolean): Promise<void> {
+  const active = await runProfileRepository.findActive()
+  if (!active) {
+    const err = new Error('No active run profile — autoRestart is stored per profile.')
+    ;(err as any).statusCode = 409
+    throw err
+  }
+  await runProfileRepository.upsertProfileService(active.id, serviceId, { autoRestart: Boolean(autoRestart) })
 }
 
 export const serviceService = {
@@ -390,6 +410,7 @@ export const serviceService = {
     await runProfileRepository.createProfileServicesForAllProfiles(service.id, {
       cudaDevice: input.cudaDevice ?? null,
       startOnBoot: input.startOnBoot ?? false,
+      autoRestart: (input as any).autoRestart ?? false,
     })
 
     await recordChange({
@@ -435,13 +456,16 @@ export const serviceService = {
     // cudaDevice and startOnBoot live on the profile-override row, not the service
     // row — split them out before the service update so Prisma never sees an unknown
     // column and the values are actually persisted where they are read from.
-    const { cudaDevice, startOnBoot, ...serviceFields } =
-      input as UpdateServiceInput & { cudaDevice?: string | null; startOnBoot?: boolean }
+    const { cudaDevice, startOnBoot, autoRestart, ...serviceFields } =
+      input as UpdateServiceInput & { cudaDevice?: string | null; startOnBoot?: boolean; autoRestart?: boolean }
     if (cudaDevice !== undefined) {
       await writeCudaDevice({ ...current, ...serviceFields }, cudaDevice ?? null)
     }
     if (startOnBoot !== undefined) {
       await writeStartOnBoot(id, Boolean(startOnBoot))
+    }
+    if (autoRestart !== undefined) {
+      await writeAutoRestart(id, Boolean(autoRestart))
     }
 
     const updated = await serviceRepository.update(id, {
@@ -565,6 +589,10 @@ export const serviceService = {
     }
     await freePortForService(service)
 
+    // Record the intent before the spawn, not after: if the start throws, the box still
+    // wants this service up, and auto-restart should keep trying.
+    await serviceRepository.setDesiredStatus(id, 'running')
+
     const env = await buildEnvForService(id, service.port)
     await processManager.startService(service.id, service.command, env, makeOnStateChange(id))
 
@@ -586,6 +614,11 @@ export const serviceService = {
       ;(err as any).statusCode = 404
       throw err
     }
+
+    // A deliberate stop is the one thing that switches auto-restart off for this
+    // service until somebody starts it again. Everything that stops a service on
+    // purpose — the Stop button, a profile switch, a deploy — comes through here.
+    await serviceRepository.setDesiredStatus(id, 'stopped')
 
     const onStateChange = makeOnStateChange(id)
     await processManager.stopService(id, onStateChange)
@@ -633,6 +666,8 @@ export const serviceService = {
     }
     await freePortForService(service)
 
+    await serviceRepository.setDesiredStatus(id, 'running')
+
     const env = await buildEnvForService(id, service.port)
     await processManager.restartService(service.id, service.command, env, makeOnStateChange(id))
 
@@ -677,6 +712,18 @@ export const serviceService = {
     const buffered = processManager.getOutput(id)
     if (buffered.length > 0) return buffered
     return readLogFileLines(id).filter(l => l.length > 0).slice(-1000)
+  },
+
+  /**
+   * The service's recent Service-Manager events — deaths, refused starts, profile-switch
+   * stops, auto-restart attempts — read from the history file the run log's truncation
+   * does not touch. This is what makes "it went down last night, why?" answerable after
+   * the restart that erased the run log (task-1593).
+   * @param id - the service to report on
+   * @param limit - how many of the most recent events to return
+   */
+  getEvents(id: string, limit = 40) {
+    return readServiceEvents(id).slice(-limit)
   },
 
   clearOutput(id: string) {

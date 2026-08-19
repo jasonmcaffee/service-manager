@@ -53,6 +53,8 @@ const mockUpdate = jest.fn(async (_id: string, _data: any) => ({ id: _id, ..._da
 const mockCreate = jest.fn(async (input: any) => ({ id: 'new-id', ...input }))
 const mockDelete = jest.fn(async () => {})
 const mockFindByPort = jest.fn(async () => [] as any[])
+// Records the start/stop INTENT that auto-restart reads (task-1593).
+const mockSetDesiredStatus = jest.fn(async (_id: string, _desired: string) => undefined)
 
 jest.mock('@/lib/repositories/serviceRepository', () => ({
   serviceRepository: {
@@ -63,6 +65,7 @@ jest.mock('@/lib/repositories/serviceRepository', () => ({
     create: mockCreate,
     delete: mockDelete,
     findByPort: mockFindByPort,
+    setDesiredStatus: mockSetDesiredStatus,
   },
 }))
 

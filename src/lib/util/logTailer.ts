@@ -24,6 +24,47 @@ export function getLogFilePath(serviceId: string): string {
 }
 
 /**
+ * The service's durable event history: every Service-Manager-authored note, kept
+ * across restarts.
+ *
+ * The run log is truncated by each start, which meant a note explaining WHY a service
+ * died was erased by the very restart that followed it — so after the fact there was
+ * nothing left to read (task-1593). This file is only ever appended to, so "what has
+ * been happening to this service lately" is an answerable question.
+ * @param serviceId - service whose event history is wanted
+ */
+export function getEventLogFilePath(serviceId: string): string {
+  const logsDir = path.join(os.tmpdir(), 'service-manager', 'logs')
+  fs.mkdirSync(logsDir, { recursive: true })
+  return path.join(logsDir, `service-${serviceId}.events.log`)
+}
+
+/** Event history is one line per event; past this it is trimmed to the newest EVENT_KEEP_BYTES. */
+const EVENT_LOG_MAX_BYTES = 1024 * 1024
+const EVENT_LOG_KEEP_BYTES = 256 * 1024
+
+/**
+ * Appends one line to a service's durable event history, trimming the file when it
+ * outgrows its cap so it can never become the kind of runaway log that took the
+ * services endpoint down before.
+ * @param serviceId - service the event belongs to
+ * @param line - the already-formatted line
+ */
+function appendEventHistory(serviceId: string, line: string): void {
+  try {
+    const file = getEventLogFilePath(serviceId)
+    fs.appendFileSync(file, `${line}\n`, 'utf-8')
+    if (fs.statSync(file).size > EVENT_LOG_MAX_BYTES) {
+      const kept = readLogFileCapped(file, EVENT_LOG_KEEP_BYTES)
+      // Drop the leading partial line the byte-offset read almost certainly produced.
+      fs.writeFileSync(file, kept.slice(kept.indexOf('\n') + 1), 'utf-8')
+    }
+  } catch (err: any) {
+    console.warn(`[logTailer] could not append event history for ${serviceId}:`, err?.message)
+  }
+}
+
+/**
  * Reads a log file as a string while never loading more than MAX_LOG_BYTES.
  * When the file is larger than the cap, only its most-recent MAX_LOG_BYTES are
  * returned so a giant file can never exceed Node's max string length and crash.
@@ -68,8 +109,27 @@ export function appendServiceNote(serviceId: string, message: string): void {
       .map(l => `[service-manager ${stamp}] ${l.trim()}`)
       .join('\n')
     fs.appendFileSync(logFile, `${line}\n`, 'utf-8')
+    // Same line again, in the file the next start will NOT truncate.
+    appendEventHistory(serviceId, line)
   } catch (err: any) {
     console.warn(`[logTailer] could not append note for ${serviceId}:`, err?.message)
+  }
+}
+
+/**
+ * Returns the service's durable event history, newest last, capped so a caller can
+ * never be handed an unbounded string.
+ * @param serviceId - service whose history is wanted
+ * @param maxBytes - most-recent bytes to read
+ */
+export function readServiceEvents(serviceId: string, maxBytes: number = EVENT_LOG_KEEP_BYTES): string[] {
+  try {
+    const file = getEventLogFilePath(serviceId)
+    if (!fs.existsSync(file)) return []
+    return readLogFileCapped(file, maxBytes).split('\n').filter(Boolean)
+  } catch (err: any) {
+    console.warn(`[logTailer] could not read event history for ${serviceId}:`, err?.message)
+    return []
   }
 }
 

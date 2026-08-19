@@ -22,6 +22,11 @@ model Service {
 
   pid           Int?
   status        String               @default("stopped")
+  /// What the service is SUPPOSED to be doing, as opposed to what it is doing.
+  /// Set to "running" when it is started or observed listening, and to "stopped" only
+  /// by a deliberate stop (the Stop button, a profile switch, a deploy). Auto-restart
+  /// reads this, so it can never fight something that was turned off on purpose.
+  desiredStatus String               @default("stopped")
 
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt
@@ -74,6 +79,10 @@ model RunProfileService {
   serviceId   String
   cudaDevice  String?
   startOnBoot Boolean    @default(false)
+  /// Bring this service back on its own when its port goes dark unexpectedly.
+  /// Profile-scoped exactly like startOnBoot: a profile that does not want the service
+  /// running must not have it resurrected behind the profile's back.
+  autoRestart Boolean    @default(false)
   profile     RunProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
   service     Service    @relation(fields: [serviceId], references: [id], onDelete: Cascade)
 

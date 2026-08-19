@@ -48,6 +48,7 @@ jest.mock('@/lib/util/batchWriter', () => ({
 jest.mock('@/lib/util/logTailer', () => ({
   getLogFilePath: (id: string) => `C:\\tmp\\service-${id}.log`,
   logTailer: { start: jest.fn(), stop: jest.fn(), stopAll: jest.fn(), getRecent: jest.fn(() => []), clearBuffer: jest.fn() },
+  appendServiceNote: jest.fn(),
 }))
 
 jest.mock('@/lib/lifecycle', () => ({

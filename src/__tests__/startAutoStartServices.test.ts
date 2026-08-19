@@ -28,6 +28,7 @@ jest.mock('@/lib/repositories/serviceRepository', () => ({
     update: mockUpdate,
     findAll: jest.fn(async () => []),
     findByName: jest.fn(async () => null),
+    setDesiredStatus: jest.fn(async () => undefined),
   },
 }))
 
@@ -60,7 +61,7 @@ jest.mock('@/lib/util/logTailer', () => ({
 }))
 
 jest.mock('@/lib/services/reconciler', () => ({
-  reconciler: { start: jest.fn() },
+  reconciler: { start: jest.fn(), setServiceStarter: jest.fn() },
 }))
 
 // ── helpers ────────────────────────────────────────────────────────────────

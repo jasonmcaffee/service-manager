@@ -10,6 +10,7 @@ export interface CreateServiceInput {
   // cudaDevice and startOnBoot are profile-specific; stored in RunProfileService
   cudaDevice?: string | null
   startOnBoot?: boolean
+  autoRestart?: boolean
   minFreeVramMb?: number | null
 }
 
@@ -23,6 +24,7 @@ export interface UpdateServiceInput {
   status?: string
   pid?: number | null
   minFreeVramMb?: number | null
+  desiredStatus?: string
 }
 
 export const serviceRepository = {
@@ -52,6 +54,22 @@ export const serviceRepository = {
 
   async update(id: string, data: UpdateServiceInput) {
     return prisma.service.update({ where: { id }, data })
+  },
+
+  /**
+   * Records what a service is supposed to be doing, separately from what it is doing.
+   * Written on every deliberate start/stop and whenever the service is observed
+   * listening, so auto-restart can tell "it died" from "it was turned off".
+   * Never throws: intent is advisory, and losing it must not fail a start or a stop.
+   * @param id - the service whose intent changed
+   * @param desiredStatus - 'running' or 'stopped'
+   */
+  async setDesiredStatus(id: string, desiredStatus: 'running' | 'stopped') {
+    try {
+      await prisma.service.update({ where: { id }, data: { desiredStatus } })
+    } catch (err: any) {
+      console.warn(`[serviceRepository] could not set desiredStatus=${desiredStatus} for ${id}:`, err?.message)
+    }
   },
 
   async delete(id: string) {

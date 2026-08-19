@@ -16,6 +16,7 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
     description: '',
     command: '',
     startOnBoot: false,
+    autoRestart: false,
     port: '',
     cudaDevice: '',
   })
@@ -54,6 +55,7 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
           description: '',
           command: '',
           startOnBoot: false,
+          autoRestart: false,
           port: '',
           cudaDevice: '',
         })
@@ -163,6 +165,18 @@ export function AddServiceModal({ isOpen, onClose, onAdd }: AddServiceModalProps
                 className="w-4 h-4 rounded border-zinc-600 bg-zinc-700 text-accent focus:ring-accent/50"
               />
               <span className="text-sm text-zinc-400">Start on boot</span>
+            </label>
+          </div>
+
+          <div className="flex items-center">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={formData.autoRestart}
+                onChange={(e) => setFormData({ ...formData, autoRestart: e.target.checked })}
+                className="w-4 h-4 rounded border-zinc-600 bg-zinc-700 text-accent focus:ring-accent/50"
+              />
+              <span className="text-sm text-zinc-400">Auto-restart if it dies</span>
             </label>
           </div>
 

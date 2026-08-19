@@ -10,6 +10,7 @@ A modern Windows service management application built with Next.js. Consolidate 
 - 📊 **Real-time Terminal Output** - View live output from each service
 - ⚡ **Start/Stop/Restart** - Control each service independently
 - 🔄 **Auto-start on Boot** - Configure which services start automatically
+- 🛟 **Auto-restart** - Bring a service back on its own when its process dies (see below)
 - ✏️ **Inline Editing** - Edit batch file content directly in the UI
 - 🌙 **Modern Dark Theme** - Easy on the eyes, beautiful to use
 - 💾 **SQLite Database** - Persistent storage for your service configurations
@@ -144,6 +145,42 @@ service-manager/
 ├── start-dev.bat              # Development startup script
 └── package.json
 ```
+
+## Auto-restart (task-1593)
+
+`startOnBoot` fires exactly once — when Service Manager itself boots. The reconciler that
+runs every 10 s is deliberately observe-only: it reads the OS's listening ports and writes
+the answer into the DB. Nothing ever restarted a service that died at any other moment, so
+a service that fell over stayed down until a person noticed. `jasonmcaffee.com` and
+`media.jasonmcaffee.com` were both down for about twelve hours that way.
+
+**Auto-restart** is the missing half. It is per service and per run profile, sitting on the
+same override row as `startOnBoot`, and it is off by default.
+
+| Fact | Where it lives | What sets it |
+|---|---|---|
+| "this profile wants the service resurrected" | `RunProfileService.autoRestart` | the Auto-restart toggle on the card / in Edit |
+| "the box currently wants it running" | `Service.desiredStatus` | `running` on any start/restart, or the moment it is observed listening; `stopped` on a deliberate stop |
+
+The reconciler restarts a service only when **both** are true, so **pressing Stop keeps a
+service stopped** — as does a profile switch and a deploy's stop/start, since all of them
+go through `stopService`. The desired status is re-read at the moment of decision, so a
+Stop that lands mid-tick still wins. Attempts back off 5s → 15s → 30s → 1m → 2m → 5m and
+the counter resets once the service has stayed up for two minutes. An auto-restart is the
+same guarded start the Start button performs, VRAM admission included.
+
+The boot-retry sweep respects `desiredStatus` too: it exists to retry a start that *failed*,
+not to undo a Stop somebody made in the minutes after a manager boot.
+
+### Reading what happened to a service
+
+Every start truncates the service's run log, which used to erase the note explaining the
+death that preceded it. Service-Manager-authored notes are therefore also appended to a
+durable per-service history at `%TEMP%\service-manager\logs\service-<id>.events.log`, which
+nothing truncates. The newest entries are returned by `GET /api/services/[id]/output` as
+`events` and shown in the card's collapsible **Service Manager events** strip. A process
+that exits now says so there, with its exit code and whether Service Manager asked it to
+stop — the difference between "you stopped it" and "it died on you".
 
 ## API Endpoints
 

@@ -62,6 +62,7 @@ jest.mock('@/lib/repositories/serviceRepository', () => ({
     findByName: jest.fn(async (name: string) => Array.from(services.values()).find(s => s.name === name) ?? null),
     findByPort: jest.fn(async (port: number) => Array.from(services.values()).filter(s => s.port === port).map(s => ({ id: s.id, name: s.name }))),
     getPort: jest.fn(async (id: string) => services.get(id)?.port ?? null),
+    setDesiredStatus: jest.fn(async () => undefined),
     create: jest.fn(async (data: any) => {
       const row: StoredService = {
         id: nextId('svc'),

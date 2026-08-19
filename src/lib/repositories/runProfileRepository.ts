@@ -3,6 +3,7 @@ import { prisma } from '@/lib/db'
 export interface UpsertProfileServiceInput {
   cudaDevice?: string | null
   startOnBoot?: boolean
+  autoRestart?: boolean
 }
 
 const profileInclude = {
@@ -75,10 +76,12 @@ export const runProfileRepository = {
         serviceId,
         cudaDevice: data.cudaDevice ?? null,
         startOnBoot: data.startOnBoot ?? false,
+        autoRestart: data.autoRestart ?? false,
       },
       update: {
         ...(data.cudaDevice !== undefined && { cudaDevice: data.cudaDevice }),
         ...(data.startOnBoot !== undefined && { startOnBoot: data.startOnBoot }),
+        ...(data.autoRestart !== undefined && { autoRestart: data.autoRestart }),
       },
     })
   },
@@ -93,6 +96,7 @@ export const runProfileRepository = {
           serviceId,
           cudaDevice: activeProfileOverride?.cudaDevice ?? null,
           startOnBoot: activeProfileOverride?.startOnBoot ?? false,
+          autoRestart: activeProfileOverride?.autoRestart ?? false,
         },
         update: {},
       })
@@ -113,6 +117,7 @@ export const runProfileRepository = {
           serviceId: svc.serviceId,
           cudaDevice: svc.cudaDevice,
           startOnBoot: svc.startOnBoot,
+          autoRestart: svc.autoRestart,
         },
         update: {},
       })
@@ -159,6 +164,14 @@ export const runProfileRepository = {
   async findAutoStartServices(profileId: string) {
     return prisma.runProfileService.findMany({
       where: { profileId, startOnBoot: true },
+      include: { service: true },
+    })
+  },
+
+  /** Services this profile has opted into automatic restart after an unexpected death. */
+  async findAutoRestartServices(profileId: string) {
+    return prisma.runProfileService.findMany({
+      where: { profileId, autoRestart: true },
       include: { service: true },
     })
   },

@@ -19,13 +19,17 @@ interface ServiceCardProps {
 
 /** A flag flip waiting on its reason before it is sent. */
 interface PendingToggle {
-  field: 'wsl' | 'noPort' | 'startOnBoot'
+  field: 'wsl' | 'noPort' | 'startOnBoot' | 'autoRestart'
   label: string
   next: boolean
 }
 
 export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, onPatch, onEditClick, dragHandleProps }: ServiceCardProps) {
   const [output, setOutput] = useState<string[]>([])
+  // Service-Manager events that outlive the run log: why the last run ended, refused
+  // starts, profile-switch stops, auto-restart attempts (task-1593).
+  const [events, setEvents] = useState<string[]>([])
+  const [isEventsOpen, setIsEventsOpen] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [pendingToggle, setPendingToggle] = useState<PendingToggle | null>(null)
   const [toggleError, setToggleError] = useState<string | null>(null)
@@ -37,6 +41,7 @@ export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, 
       if (res.ok) {
         const data = await res.json()
         setOutput(data.output || [])
+        setEvents(data.events || [])
       }
     } catch (error) {
       console.error('Failed to fetch output:', error)
@@ -228,8 +233,42 @@ export function ServiceCard({ service, isCollapsed, onToggleCollapse, onUpdate, 
           >
             Auto-start
           </button>
+          <button
+            onClick={() => { setToggleError(null); setPendingToggle({ field: 'autoRestart', label: 'Auto-restart', next: !service.autoRestart }) }}
+            className={`px-2 py-1 rounded text-[10px] font-medium transition-all ${
+              service.autoRestart
+                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                : 'bg-zinc-800/50 text-zinc-500 border border-zinc-700/50 hover:border-zinc-600'
+            }`}
+            title={service.autoRestart
+              ? 'Comes back on its own if it dies. A deliberate Stop still keeps it stopped.'
+              : 'Stays down if it dies — nothing will restart it'}
+          >
+            Auto-restart
+          </button>
         </div>
       </div>
+
+      {/* Service Manager's own history for this service. Kept out of the terminal because
+          it is not the service's output — and kept at all because every start truncates
+          the run log, which used to erase the note explaining the death that preceded it. */}
+      {!isCollapsed && events.length > 0 && (
+        <div className="px-3 pt-2">
+          <button
+            onClick={() => setIsEventsOpen(v => !v)}
+            className="w-full text-left text-[10px] uppercase tracking-wide text-zinc-500 hover:text-zinc-300 transition-colors"
+          >
+            {isEventsOpen ? '▾' : '▸'} Service Manager events ({events.length})
+          </button>
+          {isEventsOpen && (
+            <div className="mt-1 max-h-28 overflow-y-auto rounded bg-zinc-900/60 border border-zinc-800 p-2 space-y-0.5">
+              {events.map((line, i) => (
+                <div key={i} className="text-[10px] font-mono text-zinc-400 break-words">{line}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Terminal output — hidden when collapsed */}
       {!isCollapsed && (

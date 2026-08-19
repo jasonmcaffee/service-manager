@@ -20,8 +20,12 @@ export interface Service {
   cudaDeviceConflict?: string | null
   minFreeVramMb?: number | null
   startOnBoot: boolean
+  /** Profile-scoped: bring this service back automatically if its process dies. */
+  autoRestart: boolean
   pid: number | null
   status: ServiceStatus
+  /** What the service is meant to be doing — 'running' unless deliberately stopped. */
+  desiredStatus?: string
   createdAt: string
   updatedAt: string
   output?: string[]
@@ -41,6 +45,7 @@ export interface ConfigSnapshot {
   profileName: string | null
   cudaDevice: string | null
   startOnBoot: boolean
+  autoRestart: boolean
 }
 
 /** One field that differed between two snapshots. */
@@ -75,6 +80,7 @@ export interface RunProfileService {
   serviceId: string
   cudaDevice: string | null
   startOnBoot: boolean
+  autoRestart: boolean
 }
 
 export interface RunProfile {

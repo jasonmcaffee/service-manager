@@ -264,6 +264,10 @@ async function startOneAutoStartService(entry: any): Promise<AutoStartResult> {
       })
     }
     console.log(`[init] autostart starting "${service.name}"`)
+    // Boot wants this service up. Recording the intent here is what lets the retry
+    // sweep below tell a start that FAILED (still wanted, retry it) from one a person
+    // has since stopped on purpose (leave it alone) — task-1593.
+    await serviceRepository.setDesiredStatus(service.id, 'running')
     await processManager.startService(service.id, service.command, env, makeOnStateChange(service.id))
     if (service.wsl && service.port) await ensureWslPortProxy(service.port)
     return { id: service.id, name: service.name, status: 'started' }
@@ -313,9 +317,13 @@ export async function retryFailedAutoStartServices(attempt: number): Promise<voi
   const active = await runProfileRepository.findActive()
   if (!active) return
   const entries = await runProfileRepository.findAutoStartServices(active.id)
-  const down = entries.filter((e: any) => !processManager.isRunning(e.service.id))
+  // A service somebody has stopped since boot is not a failed start — restarting it
+  // here silently undid a deliberate Stop for the first few minutes of every manager
+  // boot (found while verifying task-1593). Only services boot still wants are retried.
+  const down = entries.filter((e: any) =>
+    !processManager.isRunning(e.service.id) && e.service.desiredStatus !== 'stopped')
   if (down.length === 0) {
-    console.log(`[init] autostart retry #${attempt}: all start-on-boot services running`)
+    console.log(`[init] autostart retry #${attempt}: nothing to retry (all running or deliberately stopped)`)
     return
   }
   console.log(`[init] autostart retry #${attempt}: re-attempting ${down.length} down service(s): ${down.map((e: any) => e.service.name).join(', ')}`)
@@ -366,6 +374,15 @@ export function initializeIfNeeded(): Promise<void> {
         processManager.markBootStarted()
         await startAutoStartServices()
       }
+      // Hand the reconciler a way to bring a dead service back. Registered here, after
+      // boot autostart, for two reasons: auto-restart must never race the boot sequence
+      // over the same service, and serviceService imports this module, so a static
+      // import of it from the reconciler would be a cycle. An auto-restart is then
+      // byte-for-byte the same guarded start the Start button performs.
+      reconciler.setServiceStarter(async (id: string) => {
+        const { serviceService } = await import('@/lib/services/serviceService')
+        return serviceService.startService(id)
+      })
       reconciler.start()
     })()
   }

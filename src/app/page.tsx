@@ -73,6 +73,7 @@ const SortableServiceCard = memo(function SortableServiceCard({ service, isColla
     prev.service.command === next.service.command &&
     prev.service.cudaDevice === next.service.cudaDevice &&
     prev.service.startOnBoot === next.service.startOnBoot &&
+    prev.service.autoRestart === next.service.autoRestart &&
     prev.isCollapsed === next.isCollapsed
   )
 })

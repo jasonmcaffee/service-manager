@@ -14,7 +14,7 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { name, description, command, startOnBoot, port, noPort, wsl, cudaDevice, minFreeVramMb } = body
+    const { name, description, command, startOnBoot, autoRestart, port, noPort, wsl, cudaDevice, minFreeVramMb } = body
 
     const { reason, author } = extractChangeContext(request, body)
 
@@ -23,6 +23,7 @@ export async function POST(request: NextRequest) {
       description,
       command,
       startOnBoot,
+      autoRestart,
       port: port ?? null,
       noPort: noPort ?? false,
       wsl: wsl ?? false,

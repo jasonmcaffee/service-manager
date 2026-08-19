@@ -61,7 +61,7 @@ jest.mock('@/lib/util/portHelper', () => ({
 }))
 
 jest.mock('@/lib/services/reconciler', () => ({
-  reconciler: { start: jest.fn() },
+  reconciler: { start: jest.fn(), setServiceStarter: jest.fn() },
 }))
 
 jest.mock('@/lib/lifecycle', () => ({

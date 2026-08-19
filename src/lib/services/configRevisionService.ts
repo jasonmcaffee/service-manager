@@ -9,7 +9,7 @@ export const MIN_REASON_LENGTH = 10
 
 /** The snapshot fields a diff compares. profileId/profileName are context, not config. */
 const DIFFABLE_FIELDS: Array<keyof ConfigSnapshot> = [
-  'name', 'description', 'command', 'port', 'noPort', 'wsl', 'minFreeVramMb', 'cudaDevice', 'startOnBoot',
+  'name', 'description', 'command', 'port', 'noPort', 'wsl', 'minFreeVramMb', 'cudaDevice', 'startOnBoot', 'autoRestart',
 ]
 
 /** The fields a revert writes back. Runtime state (status/pid) is never restored. */
@@ -90,6 +90,7 @@ export async function captureSnapshot(serviceId: string, profileId?: string): Pr
     profileName: profile?.name ?? null,
     cudaDevice: override?.cudaDevice ?? null,
     startOnBoot: override?.startOnBoot ?? false,
+    autoRestart: override?.autoRestart ?? false,
   }
 }
 

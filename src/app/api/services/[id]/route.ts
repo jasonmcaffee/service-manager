@@ -21,7 +21,7 @@ export async function PUT(
 ) {
   try {
     const body = await request.json()
-    const { name, description, command, port, noPort, wsl, minFreeVramMb, cudaDevice, startOnBoot } = body
+    const { name, description, command, port, noPort, wsl, minFreeVramMb, cudaDevice, startOnBoot, autoRestart } = body
 
     // Only include fields present in the request body so callers can patch a
     // single field (e.g. wsl=true) without triggering port-uniqueness checks
@@ -40,6 +40,8 @@ export async function PUT(
     // dropping startOnBoot is why the card's Auto-start toggle never stuck.
     if (cudaDevice !== undefined) input.cudaDevice = cudaDevice ?? null
     if (startOnBoot !== undefined) input.startOnBoot = Boolean(startOnBoot)
+    // autoRestart lives on the same profile-override row as startOnBoot.
+    if (autoRestart !== undefined) input.autoRestart = Boolean(autoRestart)
 
     const { reason, author } = extractChangeContext(request, body)
     const service = await serviceService.updateService(params.id, input as any, { reason: reason ?? '', author })

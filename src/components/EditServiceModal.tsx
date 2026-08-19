@@ -35,6 +35,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
     description: '',
     command: '',
     startOnBoot: false,
+    autoRestart: false,
     port: '',
     cudaDevice: '',
   })
@@ -58,6 +59,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
       description: next.description || '',
       command: next.command,
       startOnBoot: next.startOnBoot,
+      autoRestart: Boolean(next.autoRestart),
       port: next.port ? String(next.port) : '',
       cudaDevice: next.cudaDevice || '',
     })
@@ -130,6 +132,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
           body: JSON.stringify({
             ...(pinnedByCommand ? {} : { cudaDevice: formData.cudaDevice || null }),
             startOnBoot: formData.startOnBoot,
+            autoRestart: formData.autoRestart,
             reason: reason.trim(),
           }),
         })
@@ -143,6 +146,7 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
         ...updated,
         cudaDevice: formData.cudaDevice || null,
         startOnBoot: formData.startOnBoot,
+        autoRestart: formData.autoRestart,
       })
       onClose()
     } catch (error: any) {
@@ -327,6 +331,25 @@ export function EditServiceModal({ service, isOpen, activeProfileId, onClose, on
               </span>
             </label>
           </div>
+
+          <div className="flex items-center">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={formData.autoRestart}
+                onChange={(e) => setFormData({ ...formData, autoRestart: e.target.checked })}
+                className="w-4 h-4 rounded border-zinc-600 bg-zinc-700 text-accent focus:ring-accent/50"
+              />
+              <span className="text-sm text-zinc-400">
+                Auto-restart if it dies
+                <FieldBadge type="profile" />
+              </span>
+            </label>
+          </div>
+          <p className="-mt-2 text-xs text-zinc-500">
+            Brings the service back on its own when its port goes dark unexpectedly, with
+            backoff between attempts. Pressing Stop still keeps it stopped.
+          </p>
 
           {/* Reasoning is required on every config change — it is recorded in the
               change log alongside the before/after config (task-1523). */}

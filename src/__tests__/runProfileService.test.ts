@@ -20,6 +20,7 @@ const mockServiceRepo = {
   findAll: jest.fn(async () => []),
   findById: jest.fn(async () => null),
   update: jest.fn(async (id: string, data: any) => ({ id, ...data })),
+  setDesiredStatus: jest.fn(async () => undefined),
 }
 
 jest.mock('@/lib/repositories/serviceRepository', () => ({
