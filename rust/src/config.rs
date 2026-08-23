@@ -1,0 +1,52 @@
+use anyhow::{Context, bail};
+use std::path::{Path, PathBuf};
+
+/// Runtime configuration resolved from environment variables and stable repository defaults.
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub bind_address: String,
+    pub port: u16,
+    pub database_path: PathBuf,
+    pub repository_root: PathBuf,
+    pub runtime_root: PathBuf,
+    pub passive: bool,
+    pub skip_autostart: bool,
+    pub reconcile_interval_seconds: u64,
+}
+
+impl AppConfig {
+    /// Resolves validated production defaults while allowing isolated shadow overrides.
+    pub fn from_environment() -> anyhow::Result<Self> {
+        let manifest_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repository_root = manifest_root.parent().context("Rust crate must live under repository root")?.to_path_buf();
+        let database_path = std::env::var_os("SERVICE_MANAGER_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| repository_root.join("prisma").join("service-manager.db"));
+        let runtime_root = std::env::var_os("SERVICE_MANAGER_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("service-manager"));
+        let port = std::env::var("PORT").unwrap_or_else(|_| "4000".into()).parse::<u16>()
+            .context("PORT must be an integer from 1 through 65535")?;
+        if port == 0 { bail!("PORT must be greater than zero"); }
+        Ok(Self {
+            bind_address: std::env::var("SERVICE_MANAGER_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
+            port,
+            database_path,
+            repository_root,
+            runtime_root,
+            passive: parse_boolean_environment("SM_PASSIVE"),
+            skip_autostart: parse_boolean_environment("SM_SKIP_AUTOSTART"),
+            reconcile_interval_seconds: environment_u64("SM_RECONCILE_SECONDS", 10),
+        })
+    }
+}
+
+/// Reads a permissive boolean environment variable without treating absence as an error.
+fn parse_boolean_environment(name: &str) -> bool {
+    std::env::var(name).map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(false)
+}
+
+/// Reads a positive integer environment variable and falls back to a stable default.
+fn environment_u64(name: &str, default_value: u64) -> u64 {
+    std::env::var(name).ok().and_then(|value| value.parse().ok()).filter(|value| *value > 0).unwrap_or(default_value)
+}

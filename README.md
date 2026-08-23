@@ -1,6 +1,6 @@
 # Service Manager
 
-A modern Windows service management application built with Next.js. Consolidate and manage all your startup batch files from a single, beautiful interface.
+A native Rust service manager with a Next.js/React dashboard. Rust owns process supervision, persistence, and the HTTP API; Next.js produces the static frontend served by the Rust binary.
 
 ![Dark Theme UI](https://via.placeholder.com/800x400/111318/00d9ff?text=Service+Manager)
 
@@ -19,7 +19,7 @@ A modern Windows service management application built with Next.js. Consolidate 
 
 ### Prerequisites
 
-- Node.js 18+ installed
+- Rust toolchain and Node.js 22 installed
 - npm or yarn
 
 ### Installation
@@ -34,18 +34,17 @@ A modern Windows service management application built with Next.js. Consolidate 
    npm install
    ```
 
-3. Initialize the database:
+3. Build the frontend and Rust service:
    ```bash
-   npx prisma generate
-   npx prisma db push
+   npm run build
    ```
 
-4. Start the development server:
+4. Start the native service:
    ```bash
-   npm run dev
+   npm start
    ```
 
-5. Open http://localhost:3000 in your browser
+5. Open http://localhost:4000 in your browser
 
 ### Production Mode
 
@@ -199,9 +198,9 @@ stop — the difference between "you stopped it" and "it died on you".
 ## Tech Stack
 
 - **Frontend**: Next.js 14, React 18, Tailwind CSS
-- **Backend**: Next.js API Routes
-- **Database**: SQLite with Prisma ORM
-- **Process Management**: Node.js child_process, tree-kill
+- **Backend**: Rust, Axum, Tokio, and rusqlite
+- **Database**: SQLite through rusqlite
+- **Process Management**: Native Rust process and listener supervision
 - **Icons**: Lucide React
 
 ## License

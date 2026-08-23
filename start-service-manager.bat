@@ -7,7 +7,25 @@ cd C:\jason\dev\service-manager
 echo Starting Service Manager...
 echo.
 
-:: Start Next.js in production mode (port 4000)
+:: A production UI build must exist because the Rust manager serves the exported
+:: Next app directly. .next\BUILD_ID proves this is a production build rather than
+:: output left behind by `next dev`. NODE_ENV is pinned because an inherited
+:: non-standard value makes next build emit a broken dev/prod runtime mix.
+if not exist ".next\BUILD_ID" (
+    echo No production build found - building ^(this takes a minute^)...
+    set NODE_ENV=production
+    call npm run build
+    echo.
+)
+
+:: The native binary is built independently when the UI build already exists.
+if not exist "rust\target\release\service-manager-rs.exe" (
+    echo No Rust Service Manager build found - building...
+    call npm run build:rust
+    echo.
+)
+
+:: Start the native Service Manager on port 4000.
 start /b cmd /c "npm start"
 
 :: Wait for the server to be ready
