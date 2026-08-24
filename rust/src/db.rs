@@ -73,7 +73,7 @@ impl Database {
         let connection = self.connection.lock();
         let mut statement = connection.prepare("SELECT id,name,isActive,createdAt,updatedAt FROM RunProfile ORDER BY createdAt ASC")
             .map_err(|error| AppError::internal("preparing profile list", error))?;
-        let rows = statement.query_map([], |row| Ok(profile_from_row(row)?))
+        let rows = statement.query_map([], profile_from_row)
             .map_err(|error| AppError::internal("querying profiles", error))?;
         let mut profiles = rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| AppError::internal("decoding profiles", error))?;
@@ -126,6 +126,7 @@ impl Database {
     }
 
     /// Updates global and active-profile fields atomically and appends a revision only when values change.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_service(&self, service_id: &str, mutation: &ServiceMutation, reason: &str, author: &str, change_type: &str, reverted_from: Option<&str>) -> AppResult<ServiceRow> {
         let current = self.get_service(service_id)?.ok_or_else(|| AppError::NotFound("Service not found".into()))?;
         let mut connection = self.connection.lock();
@@ -227,6 +228,7 @@ impl Database {
     }
 
     /// Updates one profile override and records its effective configuration revision.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_profile_override(&self, profile_id: &str, service_id: &str, cuda_device: Option<Option<String>>, start_on_boot: Option<bool>, auto_restart: Option<bool>, reason: &str, author: &str) -> AppResult<ProfileServiceView> {
         let profile = self.get_profile(profile_id)?.ok_or_else(|| AppError::NotFound(format!("Profile not found: {profile_id}")))?;
         let service = self.get_service(service_id)?.ok_or_else(|| AppError::NotFound("Service not found".into()))?;
@@ -236,7 +238,7 @@ impl Database {
         let current = profile.services.iter().find(|entry| entry.service_id == service_id);
         transaction.execute(
             "INSERT INTO RunProfileService (id,profileId,serviceId,cudaDevice,startOnBoot,autoRestart) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(profileId,serviceId) DO UPDATE SET cudaDevice=excluded.cudaDevice,startOnBoot=excluded.startOnBoot,autoRestart=excluded.autoRestart",
-            params![current.map(|entry| entry.id.clone()).unwrap_or_else(new_id), profile_id, service_id, cuda_device.as_ref().map(|value| value.clone()).unwrap_or_else(|| current.and_then(|entry| entry.cuda_device.clone())), bool_i64(start_on_boot.unwrap_or_else(|| current.map(|entry| entry.start_on_boot).unwrap_or(false))), bool_i64(auto_restart.unwrap_or_else(|| current.map(|entry| entry.auto_restart).unwrap_or(false)))],
+            params![current.map(|entry| entry.id.clone()).unwrap_or_else(new_id), profile_id, service_id, cuda_device.clone().unwrap_or_else(|| current.and_then(|entry| entry.cuda_device.clone())), bool_i64(start_on_boot.unwrap_or_else(|| current.map(|entry| entry.start_on_boot).unwrap_or(false))), bool_i64(auto_restart.unwrap_or_else(|| current.map(|entry| entry.auto_restart).unwrap_or(false)))],
         ).map_err(|error| AppError::internal("updating profile override", error))?;
         let after = snapshot_in_transaction(&transaction, service_id, Some(profile_id))?;
         if before != after { insert_revision(&transaction, service_id, &service.name, "update", author, reason, before.as_ref(), after.as_ref(), None)?; }
@@ -284,6 +286,7 @@ fn snapshot_in_transaction(connection: &Connection, service_id: &str, profile_id
 }
 
 /// Inserts an immutable revision and precomputes its changed-field array.
+#[allow(clippy::too_many_arguments)]
 fn insert_revision(connection: &Connection, service_id: &str, service_name: &str, change_type: &str, author: &str, reason: &str, previous: Option<&ConfigSnapshot>, snapshot: Option<&ConfigSnapshot>, reverted_from: Option<&str>) -> AppResult<()> {
     let changed_fields = diff_snapshots(previous, snapshot);
     let profile_id = snapshot.and_then(|value| value.profile_id.clone()).or_else(|| previous.and_then(|value| value.profile_id.clone()));
@@ -314,7 +317,7 @@ fn update_active_override(connection: &Connection, service_id: &str, mutation: &
     let profile_id: String = connection.query_row("SELECT id FROM RunProfile WHERE isActive=1 LIMIT 1", [], |row| row.get(0)).optional().map_err(|error| AppError::internal("querying active profile", error))?.ok_or_else(|| AppError::Conflict("No active run profile".into()))?;
     let current = connection.query_row("SELECT id,cudaDevice,startOnBoot,autoRestart FROM RunProfileService WHERE profileId=?1 AND serviceId=?2", params![profile_id, service_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)? != 0, row.get::<_, i64>(3)? != 0))).optional().map_err(|error| AppError::internal("querying active service override", error))?;
     let (id, cuda, boot, restart) = current.unwrap_or_else(|| (new_id(), None, false, false));
-    connection.execute("INSERT INTO RunProfileService (id,profileId,serviceId,cudaDevice,startOnBoot,autoRestart) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(profileId,serviceId) DO UPDATE SET cudaDevice=excluded.cudaDevice,startOnBoot=excluded.startOnBoot,autoRestart=excluded.autoRestart", params![id, profile_id, service_id, mutation.cuda_device.as_ref().map(|value| value.clone()).unwrap_or(cuda), bool_i64(mutation.start_on_boot.unwrap_or(boot)), bool_i64(mutation.auto_restart.unwrap_or(restart))]).map_err(|error| AppError::internal("updating active service override", error))?;
+    connection.execute("INSERT INTO RunProfileService (id,profileId,serviceId,cudaDevice,startOnBoot,autoRestart) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(profileId,serviceId) DO UPDATE SET cudaDevice=excluded.cudaDevice,startOnBoot=excluded.startOnBoot,autoRestart=excluded.autoRestart", params![id, profile_id, service_id, mutation.cuda_device.clone().unwrap_or(cuda), bool_i64(mutation.start_on_boot.unwrap_or(boot)), bool_i64(mutation.auto_restart.unwrap_or(restart))]).map_err(|error| AppError::internal("updating active service override", error))?;
     Ok(())
 }
 

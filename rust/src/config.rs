@@ -25,9 +25,18 @@ impl AppConfig {
         let runtime_root = std::env::var_os("SERVICE_MANAGER_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("service-manager"));
-        let port = std::env::var("PORT").unwrap_or_else(|_| "4000".into()).parse::<u16>()
-            .context("PORT must be an integer from 1 through 65535")?;
-        if port == 0 { bail!("PORT must be greater than zero"); }
+        // SERVICE_MANAGER_PORT only. A bare PORT is deliberately IGNORED: every managed service's
+        // wrapper script sets PORT for the service it is launching, so any process descended from a
+        // managed service - which is every agent terminal on this box - inherits somebody else's
+        // PORT. Honouring it made the manager try to bind 8092, the Claude terminal daemon's port,
+        // when it was started from such a shell. It failed to bind and exited, but had that port
+        // been free the manager would have taken a managed service's address.
+        let port = std::env::var("SERVICE_MANAGER_PORT").unwrap_or_else(|_| "4000".into()).parse::<u16>()
+            .context("SERVICE_MANAGER_PORT must be an integer from 1 through 65535")?;
+        if port == 0 { bail!("SERVICE_MANAGER_PORT must be greater than zero"); }
+        if let Ok(inherited) = std::env::var("PORT") {
+            tracing::debug!(%inherited, "ignoring an inherited PORT; the manager binds SERVICE_MANAGER_PORT or 4000");
+        }
         Ok(Self {
             bind_address: std::env::var("SERVICE_MANAGER_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
             port,

@@ -1,5 +1,4 @@
 use crate::error::{AppError, AppResult};
-use crate::logging::clear_run_log;
 use crate::models::{ProfileOverrideMutation, ServiceMutation};
 use crate::service::AppState;
 use crate::system::snapshot_listeners;
@@ -109,9 +108,9 @@ async fn control_service(State(state): State<AppState>, Path(id): Path<String>, 
 /// Returns bounded run logs, durable events, status, and PID.
 async fn service_output(State(state): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> { Ok(Json(state.service_output(&id)?)) }
 
-/// Clears one run log without touching durable Service Manager events.
+/// Clears one service's captured output without touching durable Service Manager events.
 async fn clear_output(State(state): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
-    clear_run_log(&state.config.runtime_root, &id)?;
+    state.clear_service_output(&id);
     Ok(Json(json!({"success":true})))
 }
 
@@ -194,7 +193,14 @@ async fn kill_port_result(state: &AppState, port: i64) -> AppResult<Value> {
     let service = state.database.get_service(&owner_id)?.ok_or_else(|| AppError::NotFound("Service not found".into()))?;
     let pids = state.processes.free_port(&service).await?;
     if pids.is_empty() { return Err(AppError::NotFound(format!("No process found on port {port}"))); }
-    Ok(json!({"message":format!("Killed PID{}: {}", if pids.len()>1 {"s"} else {""}, pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")),"pids":pids,"wsl":service.wsl}))
+    // Freeing the port is not the same as freeing the card, so the owning service's GPUs are swept
+    // and whatever is left on them is reported in the response rather than left to be discovered in
+    // nvidia-smi later (task-1493).
+    let vram_notes = state.sweep_owner_gpu(&service).await;
+    let suffix = if vram_notes.is_empty() { String::new() } else { format!("\n{}", vram_notes.join("\n")) };
+    let mut body = json!({"message":format!("Killed PID{}: {}{suffix}", if pids.len()>1 {"s"} else {""}, pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")),"pids":pids,"wsl":service.wsl});
+    if !vram_notes.is_empty() { body["vramNotes"] = json!(vram_notes); }
+    Ok(body)
 }
 
 /// Serves the existing pre-rendered Next.js UI and rejects unknown API paths as JSON 404s.

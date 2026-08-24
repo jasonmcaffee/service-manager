@@ -2,11 +2,11 @@ use crate::config::AppConfig;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::gpu::{assert_vram_available, cuda_device_conflict, command_cuda_device, effective_cuda_device, parse_cuda_devices, reap_owned_gpu_orphans};
-use crate::logging::{append_service_event, cap_all_run_logs, read_run_log, read_service_events, run_log_path};
+use crate::logging::{append_service_event, cap_all_run_logs, read_run_log_from, read_service_events, run_log_path, run_log_size};
 use crate::metrics::Metrics;
 use crate::models::{ConfigSnapshot, ProfileOverrideMutation, ProfileView, ServiceMutation, ServiceRow, ServiceView};
 use crate::process::{ProcessKind, ProcessSupervisor};
-use crate::system::{ListenerSnapshot, ensure_wsl_port_proxy, snapshot_listeners, snapshot_process_table};
+use crate::system::{ListenerSnapshot, ProcessTable, ensure_wsl_port_proxy, is_wsl_proxy_pid, snapshot_listeners, snapshot_process_table};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -33,13 +33,20 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     boot_started: Arc<AtomicBool>,
     restart_state: Arc<Mutex<HashMap<String, RestartState>>>,
+    /// Byte offset each service's output was last cleared at.
+    ///
+    /// Clearing cannot truncate the file — the running service's log pump owns the write handle —
+    /// so "clear output" records where the caller cleared and reads from there, which is what the
+    /// old in-memory ring buffer did. Reset on every start, when the log genuinely restarts.
+    cleared_offsets: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 /// Opens persistence, adopts live services, performs guarded boot startup, and starts reconciliation.
 pub async fn initialize_state(config: AppConfig) -> anyhow::Result<AppState> {
     let database = Arc::new(Database::open(&config.database_path)?);
     let processes = ProcessSupervisor::new(config.clone(), database.clone());
-    let state = AppState { config, database, processes, metrics: Arc::new(Metrics::new()), boot_started: Arc::new(AtomicBool::new(false)), restart_state: Arc::new(Mutex::new(HashMap::new())) };
+    let state = AppState { config, database, processes, metrics: Arc::new(Metrics::new()), boot_started: Arc::new(AtomicBool::new(false)), restart_state: Arc::new(Mutex::new(HashMap::new())), cleared_offsets: Arc::new(Mutex::new(HashMap::new())) };
+    state.warn_when_dashboard_build_is_missing();
     state.reconcile_once().await.map_err(|error| anyhow::anyhow!(error.to_string()))?;
     if !state.config.passive && !state.config.skip_autostart {
         state.run_auto_start().await.map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -123,6 +130,13 @@ impl AppState {
         self.require_active_mode("start services")?;
         let service = self.database.get_service(service_id)?.ok_or_else(|| AppError::NotFound("Service not found".into()))?;
         let registered = self.database.active_override(service_id)?.and_then(|entry| entry.cuda_device);
+        // A registration that disagrees with a pin the command hard-codes has to be said out loud
+        // in the place a person looks. Without it the guard silently polices a different card from
+        // the one the process gets, which is exactly what task-1493 was raised for.
+        if let Some(conflict) = cuda_device_conflict(registered.as_deref(), &service.command) {
+            tracing::warn!(service = %service.name, %conflict, "service GPU registration disagrees with its command");
+            let _ = append_service_event(&self.config.runtime_root, service_id, &conflict);
+        }
         if !self.processes.is_running(service_id) {
             self.reap_gpu_orphans(&service, registered.as_deref()).await?;
             let occupants = self.gpu_occupants(service_id)?;
@@ -134,10 +148,11 @@ impl AppState {
         self.processes.free_port(&service).await?;
         self.database.set_desired_status(service_id, "running")?;
         let environment = self.service_environment(&service, registered.as_deref());
+        // The wrapper truncates the run log, so a clear recorded against the previous run's bytes
+        // would hide the new run's output.
+        self.cleared_offsets.lock().remove(service_id);
         let process = self.processes.start(&service, &environment).await?;
-        if service.wsl {
-            if let Some(port) = service.port.and_then(|value| u16::try_from(value).ok()) { ensure_wsl_port_proxy(port).await?; }
-        }
+        if let Some(port) = service.port.and_then(|value| u16::try_from(value).ok()).filter(|_| service.wsl) { ensure_wsl_port_proxy(port).await?; }
         self.metrics.note_start();
         Ok(serde_json::json!({"id":service_id,"status":process.status,"pid":process.pid}))
     }
@@ -227,7 +242,7 @@ impl AppState {
         let service = self.database.get_service(service_id)?.ok_or_else(|| AppError::NotFound("Service not found".into()))?;
         validate_cuda_registration(mutation.cuda_device.as_ref().and_then(|value| value.as_deref()), &service.command)?;
         let override_entry = self.database.update_profile_override(profile_id, service_id, mutation.cuda_device.clone(), mutation.start_on_boot, mutation.auto_restart, reason, author)?;
-        Ok(serde_json::to_value(override_entry).map_err(|error| AppError::internal("serializing profile override", error))?)
+        serde_json::to_value(override_entry).map_err(|error| AppError::internal("serializing profile override", error))
     }
 
     /// Performs one OS-to-database reconcile pass with exact port and PID claims.
@@ -239,16 +254,35 @@ impl AppState {
         services.sort_by_key(|service| !boot_ids.contains(&service.id));
         let mut claimed_ports = HashSet::new();
         let mut claimed_pids = HashSet::new();
-        for service in &services { self.reconcile_service(service, &snapshot, &mut claimed_ports, &mut claimed_pids)?; }
+        // Needed to tell a real Windows listener from WSL's forwarding proxy. Best-effort: when the
+        // probe fails the pass still runs, it just cannot spot a proxy PID this tick.
+        let table = snapshot_process_table().await.unwrap_or_default();
+        for service in &services { self.reconcile_service(service, &snapshot, &table, &mut claimed_ports, &mut claimed_pids)?; }
         if !self.config.passive { self.supervise_auto_restart(&services, active.as_ref()).await; }
         cap_all_run_logs(&self.config.runtime_root)?;
         self.metrics.note_reconcile();
         Ok(())
     }
 
+    /// Records that a caller cleared this service's output, without fighting the log's write handle.
+    ///
+    /// The pump the running service pipes through holds the only write handle, so `File::create`
+    /// against it fails with a sharing violation — which is why this endpoint returned 500 for
+    /// every running service. Anchoring the clear to the current length reproduces the old
+    /// behaviour exactly: the file is left alone and the output reads empty from here on.
+    /// @param service_id - the service whose output should read as cleared
+    pub fn clear_service_output(&self, service_id: &str) {
+        self.cleared_offsets.lock().insert(service_id.to_owned(), run_log_size(&self.config.runtime_root, service_id));
+    }
+
+    /// Returns the byte offset this service's output was last cleared at.
+    fn cleared_offset(&self, service_id: &str) -> u64 {
+        self.cleared_offsets.lock().get(service_id).copied().unwrap_or(0)
+    }
+
     /// Reads bounded run output and durable event history for the output endpoint.
     pub fn service_output(&self, service_id: &str) -> AppResult<serde_json::Value> {
-        let output = read_run_log(&self.config.runtime_root, service_id, 1000)?;
+        let output = read_run_log_from(&self.config.runtime_root, service_id, self.cleared_offset(service_id), 1000)?;
         let events = read_service_events(&self.config.runtime_root, service_id, 12)?;
         let process = self.processes.status(service_id);
         Ok(serde_json::json!({"output":output,"events":events,"status":process.as_ref().map(|value| value.status.as_str()).unwrap_or("stopped"),"pid":process.and_then(|value| value.pid)}))
@@ -265,16 +299,16 @@ impl AppState {
     fn hydrate_service(&self, service: ServiceRow, override_entry: Option<&crate::models::ProfileServiceView>, include_output: bool) -> ServiceView {
         let registered = override_entry.and_then(|entry| entry.cuda_device.clone());
         let tracked = self.processes.status(&service.id);
-        let output = include_output.then(|| read_run_log(&self.config.runtime_root, &service.id, 1000).unwrap_or_default());
+        let output = include_output.then(|| read_run_log_from(&self.config.runtime_root, &service.id, self.cleared_offset(&service.id), 1000).unwrap_or_default());
         ServiceView { id: service.id, name: service.name, description: service.description, command: service.command.clone(), port: service.port, no_port: service.no_port, wsl: service.wsl, cuda_device: effective_cuda_device(registered.as_deref(), &service.command), registered_cuda_device: registered.clone(), cuda_device_source: if command_cuda_device(&service.command).is_some() { "command".into() } else { "profile".into() }, cuda_device_conflict: cuda_device_conflict(registered.as_deref(), &service.command), min_free_vram_mb: service.min_free_vram_mb, start_on_boot: override_entry.map(|entry| entry.start_on_boot).unwrap_or(false), auto_restart: override_entry.map(|entry| entry.auto_restart).unwrap_or(false), pid: tracked.as_ref().and_then(|value| value.pid).map(i64::from).or(service.pid), status: tracked.map(|value| value.status).unwrap_or(service.status), desired_status: service.desired_status, created_at: service.created_at, updated_at: service.updated_at, output }
     }
 
     /// Reconciles one service against a shared listener snapshot and claim set.
-    fn reconcile_service(&self, service: &ServiceRow, snapshot: &ListenerSnapshot, claimed_ports: &mut HashSet<u16>, claimed_pids: &mut HashSet<(ProcessKind, u32)>) -> AppResult<()> {
+    fn reconcile_service(&self, service: &ServiceRow, snapshot: &ListenerSnapshot, table: &ProcessTable, claimed_ports: &mut HashSet<u16>, claimed_pids: &mut HashSet<(ProcessKind, u32)>) -> AppResult<()> {
         let Some(port) = service.port.and_then(|value| u16::try_from(value).ok()) else { return self.reconcile_no_port(service) };
         if self.processes.status(&service.id).is_some_and(|process| process.kind == ProcessKind::Spawned && process.status == "running") { claimed_ports.insert(port); return Ok(()); }
         if claimed_ports.contains(&port) { return self.processes.mark_stopped(service, "another service claimed its port first") }
-        let candidate = listener_candidate(service, port, snapshot);
+        let candidate = listener_candidate(service, port, snapshot, table);
         if let Some((kind, pid)) = candidate {
             if claimed_pids.contains(&(kind.clone(), pid)) { return self.processes.mark_stopped(service, "another service claimed its process first") }
             claimed_ports.insert(port);
@@ -347,6 +381,20 @@ impl AppState {
         Ok(occupants)
     }
 
+    /// Performs the scoped GPU orphan sweep for a service by id, for callers that only have a port.
+    ///
+    /// Killing the PID on a port is not the same as freeing the card: kill-port reported success on
+    /// 8080 while a different `llama-server.exe` still held 30 GB on GPU 1 (task-1493), so the
+    /// explicit Kill Port action sweeps the owning service's cards exactly as a stop does.
+    /// @param service - the registered service that owns the port that was just freed
+    pub async fn sweep_owner_gpu(&self, service: &ServiceRow) -> Vec<String> {
+        let registered = self.database.active_override(&service.id).ok().flatten().and_then(|entry| entry.cuda_device);
+        match self.reap_gpu_orphans(service, registered.as_deref()).await {
+            Ok(notes) => notes,
+            Err(error) => { tracing::warn!(service = %service.name, %error, "post-kill VRAM sweep failed"); Vec::new() }
+        }
+    }
+
     /// Performs the scoped GPU orphan sweep and writes each decision to durable service events.
     async fn reap_gpu_orphans(&self, service: &ServiceRow, registered: Option<&str>) -> AppResult<Vec<String>> {
         let table = snapshot_process_table().await?;
@@ -412,9 +460,34 @@ fn boot_retry_candidates(services: &[ServiceRow], profile: &ProfileView, running
 }
 
 /// Chooses the authoritative listener for a service while ignoring WSL's Windows proxy PID.
-fn listener_candidate(service: &ServiceRow, port: u16, snapshot: &ListenerSnapshot) -> Option<(ProcessKind, u32)> {
-    if service.wsl { return snapshot.wsl.as_ref()?.get(&port)?.first().copied().map(|pid| (ProcessKind::WslAdopted, pid)); }
-    snapshot.windows.as_ref().and_then(|map| map.get(&port)).and_then(|pids| pids.first()).copied().map(|pid| (ProcessKind::WindowsAdopted, pid)).or_else(|| snapshot.wsl.as_ref().and_then(|map| map.get(&port)).and_then(|pids| pids.first()).copied().map(|pid| (ProcessKind::WslAdopted, pid)))
+///
+/// A WSL service only ever adopts from the WSL map: the Windows-side proxy stays on the forwarded
+/// port after the WSL process has stopped, so using it as the health signal is a permanent false
+/// positive. A Windows service skips a proxy PID too and falls through to a real WSL listener,
+/// which is the case a service that quietly moved into WSL produces.
+fn listener_candidate(service: &ServiceRow, port: u16, snapshot: &ListenerSnapshot, table: &ProcessTable) -> Option<(ProcessKind, u32)> {
+    let wsl_candidate = || snapshot.wsl.as_ref().and_then(|map| map.get(&port)).and_then(|pids| pids.first()).copied().map(|pid| (ProcessKind::WslAdopted, pid));
+    if service.wsl { return wsl_candidate(); }
+    snapshot.windows.as_ref()
+        .and_then(|map| map.get(&port))
+        .and_then(|pids| pids.iter().find(|pid| !is_wsl_proxy_pid(**pid, table)))
+        .copied()
+        .map(|pid| (ProcessKind::WindowsAdopted, pid))
+        .or_else(wsl_candidate)
+}
+
+/// Warns loudly when the dashboard build the manager serves is missing.
+///
+/// The manager answers every UI request with a 503 when `.next` holds no production build, which is
+/// invisible unless somebody opens the page: the desktop app shows the same plain-text line. Saying
+/// it once at startup, naming the file and the command, turns a silent dead dashboard into
+/// something the operator sees the moment the manager comes up.
+impl AppState {
+    fn warn_when_dashboard_build_is_missing(&self) {
+        let index = self.config.repository_root.join(".next").join("server").join("app").join("index.html");
+        if index.exists() { return; }
+        tracing::error!(expected = %index.display(), "Service Manager dashboard build is MISSING - every UI request will answer 503. Run `npm run build:ui` in the repository root.");
+    }
 }
 
 /// Returns whether the relevant OS listener snapshot succeeded for a service.
@@ -439,8 +512,8 @@ fn validate_port(port: Option<i64>) -> AppResult<()> {
 fn validate_cuda_registration(registered: Option<&str>, command: &str) -> AppResult<()> {
     let Some(registered) = registered.map(str::trim).filter(|value| !value.is_empty()) else { return Ok(()) };
     if parse_cuda_devices(registered).is_empty() { return Err(AppError::BadRequest(format!("cudaDevice must be a GPU index or comma-separated mask, got \"{registered}\""))); }
-    if let Some(command_pin) = command_cuda_device(command) {
-        if parse_cuda_devices(registered) != parse_cuda_devices(&command_pin) { return Err(AppError::Conflict(format!("Cannot set cudaDevice to \"{registered}\": the start command hard-codes GPU \"{command_pin}\"."))); }
+    if let Some(command_pin) = command_cuda_device(command).filter(|pin| parse_cuda_devices(registered) != parse_cuda_devices(pin)) {
+        return Err(AppError::Conflict(format!("Cannot set cudaDevice to \"{registered}\": the start command hard-codes GPU \"{command_pin}\".")));
     }
     Ok(())
 }
@@ -495,14 +568,22 @@ mod tests {
     #[test]
     fn listener_selection_prefers_windows_for_windows_services() {
         let snapshot = ListenerSnapshot { windows: Some(HashMap::from([(45000, vec![10])])), wsl: Some(HashMap::from([(45000, vec![20])])) };
-        assert_eq!(listener_candidate(&fixture_service("windows", "running", false), 45000, &snapshot), Some((ProcessKind::WindowsAdopted, 10)));
+        assert_eq!(listener_candidate(&fixture_service("windows", "running", false), 45000, &snapshot, &ProcessTable::default()), Some((ProcessKind::WindowsAdopted, 10)));
+    }
+
+    /// A Windows service never adopts WSL's forwarding proxy; it falls through to the real listener.
+    #[test]
+    fn listener_selection_skips_the_wsl_forwarding_proxy() {
+        let snapshot = ListenerSnapshot { windows: Some(HashMap::from([(45000, vec![10])])), wsl: Some(HashMap::from([(45000, vec![20])])) };
+        let table = ProcessTable { parent_by_pid: HashMap::new(), name_by_pid: HashMap::from([(10, "svchost.exe".into())]), command_by_pid: HashMap::new() };
+        assert_eq!(listener_candidate(&fixture_service("windows", "running", false), 45000, &snapshot, &table), Some((ProcessKind::WslAdopted, 20)));
     }
 
     /// WSL services never adopt the Windows proxy PID for their forwarded port.
     #[test]
     fn listener_selection_uses_wsl_pid_for_wsl_services() {
         let snapshot = ListenerSnapshot { windows: Some(HashMap::from([(45000, vec![10])])), wsl: Some(HashMap::from([(45000, vec![20])])) };
-        assert_eq!(listener_candidate(&fixture_service("wsl", "running", true), 45000, &snapshot), Some((ProcessKind::WslAdopted, 20)));
+        assert_eq!(listener_candidate(&fixture_service("wsl", "running", true), 45000, &snapshot, &ProcessTable::default()), Some((ProcessKind::WslAdopted, 20)));
     }
 
     /// A failed relevant snapshot remains unknown instead of proving a service stopped.
