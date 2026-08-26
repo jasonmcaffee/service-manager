@@ -1,10 +1,11 @@
 use anyhow::{Context, bail};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 /// Runtime configuration resolved from environment variables and stable repository defaults.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub bind_address: String,
+    pub bind_override: Option<String>,
     pub port: u16,
     pub database_path: PathBuf,
     pub repository_root: PathBuf,
@@ -38,7 +39,7 @@ impl AppConfig {
             tracing::debug!(%inherited, "ignoring an inherited PORT; the manager binds SERVICE_MANAGER_PORT or 4000");
         }
         Ok(Self {
-            bind_address: std::env::var("SERVICE_MANAGER_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
+            bind_override: std::env::var("SERVICE_MANAGER_BIND").ok().filter(|value| !value.trim().is_empty()),
             port,
             database_path,
             repository_root,
@@ -47,6 +48,34 @@ impl AppConfig {
             skip_autostart: parse_boolean_environment("SM_SKIP_AUTOSTART"),
             reconcile_interval_seconds: environment_u64("SM_RECONCILE_SECONDS", 10),
         })
+    }
+
+    /// Lists every socket address the manager must listen on, defaulting to BOTH loopback families.
+    ///
+    /// `localhost` resolves to `::1` before `127.0.0.1` on Windows, so an IPv4-only listener leaves
+    /// the IPv6 loopback unclaimed - and any other process is then free to bind it and answer for the
+    /// Service Manager. That is not hypothetical: a stale `next dev` left over from the pre-Rust
+    /// startup script bound `[::]:4000`, so every browser and the desktop webview reached the old Node
+    /// UI, whose API routes no longer exist, and the page reported "Failed to load services" while the
+    /// real manager sat healthy on 127.0.0.1. Claiming both families means the manager always answers
+    /// `localhost`. Note that this wins by specificity, not by exclusion: Windows still lets another
+    /// process bind the `::` wildcard alongside a specific `::1` bind, but a connection goes to the
+    /// most specific matching listener, so the squatter binds and then never receives anything.
+    /// Measured on task-1668 with a `next dev`-shaped squatter running: all nine host/path
+    /// combinations still came back from the manager.
+    /// An explicit SERVICE_MANAGER_BIND is honoured verbatim and is never expanded to a second family.
+    pub fn listen_addresses(&self) -> anyhow::Result<Vec<SocketAddr>> {
+        let Some(requested) = self.bind_override.as_deref() else {
+            return Ok(vec![
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), self.port),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port),
+            ]);
+        };
+        let address = requested
+            .trim()
+            .parse::<IpAddr>()
+            .with_context(|| format!("SERVICE_MANAGER_BIND must be an IP address, got {requested}"))?;
+        Ok(vec![SocketAddr::new(address, self.port)])
     }
 }
 
