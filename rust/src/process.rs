@@ -154,17 +154,17 @@ impl ProcessSupervisor {
         }
         sleep(Duration::from_millis(150)).await;
         // A termination that could not be run is reported rather than propagated (see
-        // `terminate_windows_pid`), so the stop has to establish for itself that the service is
-        // really down instead of trusting the kill. Freeing the port is the second attempt; the
-        // check after it is the evidence. A survivor is a Conflict rather than a silent success,
-        // because a stop that reports success while the old build still serves is how two deploys
-        // went out against the previous build without saying so (task-1974).
+        // `terminate_windows_pid`), so the stop establishes for itself whether the port came free
+        // instead of trusting the kill, and says so. It is deliberately NOT an error: a process the
+        // manager is not allowed to reap can legitimately still hold the port - the prod UI's
+        // `next start` outlives this stop every time, which is why `deploy-prod.ps1` has its own
+        // sweep - and failing the stop for that would abort a deploy that was about to handle it.
+        // Terminating the tracked process and freeing what it may is the whole of this stop's job;
+        // naming what survived is how a caller finds out it has more to do (task-1974).
         if let Some(port) = service.port.and_then(|value| u16::try_from(value).ok()) {
             self.free_exact_port(service, port).await?;
-            if let Some(survivors) = self.port_survivors(port).await {
-                let detail = format!("Stop could NOT free port {port}: still held by PID(s) {}.", survivors.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
-                append_service_event(&self.config.runtime_root, &service.id, &detail)?;
-                return Err(AppError::Conflict(detail));
+            if let Some(holders) = self.port_survivors(port).await {
+                append_service_event(&self.config.runtime_root, &service.id, &format!("Stopped, but port {port} is STILL held by PID(s) {} that this service does not own.", holders.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")))?;
             }
         }
         self.tracked.write().insert(service.id.clone(), TrackedProcess { status: "stopped".into(), pid: None, wrapper_pid: None, kind: ProcessKind::WindowsAdopted });
