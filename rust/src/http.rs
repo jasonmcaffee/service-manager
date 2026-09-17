@@ -99,10 +99,31 @@ async fn delete_service(State(state): State<AppState>, Path(id): Path<String>, h
 #[derive(Deserialize)]
 struct ControlBody { action: String }
 
-/// Dispatches one lifecycle action through the guarded domain service.
-async fn control_service(State(state): State<AppState>, Path(id): Path<String>, Json(body): Json<ControlBody>) -> AppResult<Json<Value>> {
-    let result = match body.action.as_str() { "start" => state.start_service(&id).await?, "stop" => state.stop_service(&id).await?, "restart" => state.restart_service(&id).await?, _ => return Err(AppError::BadRequest("Invalid action".into())) };
-    Ok(Json(result))
+/// How long a control request waits for its action before answering that the action is still running.
+///
+/// Every operating-system probe in a start is capped at 8s, and a start takes three of them in
+/// series, so a loaded box can legitimately need most of a minute. Holding the connection open for
+/// all of it teaches callers to set their own timeout, and a caller timeout is what took prod down
+/// three times on task-1974. Answering 202 instead gives the caller something to act on - the action
+/// is underway, poll the service - while the action itself runs to completion regardless.
+const CONTROL_RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Dispatches one lifecycle action through the guarded domain service without letting the caller cancel it.
+///
+/// The action runs on a detached task, so a client that disconnects or times out loses only the
+/// response. A quick action answers 200 with the finished status exactly as it always did; one still
+/// running at the deadline answers 202 and keeps going.
+async fn control_service(State(state): State<AppState>, Path(id): Path<String>, Json(body): Json<ControlBody>) -> AppResult<Response> {
+    if !matches!(body.action.as_str(), "start" | "stop" | "restart") { return Err(AppError::BadRequest("Invalid action".into())); }
+    let handle = state.spawn_control_action(&id, &body.action);
+    match tokio::time::timeout(CONTROL_RESPONSE_DEADLINE, handle).await {
+        Ok(Ok(result)) => Ok(Json(result?).into_response()),
+        Ok(Err(error)) => Err(AppError::internal("running a service lifecycle action", error)),
+        Err(_) => {
+            tracing::warn!(service = %id, action = %body.action, "lifecycle action still running at the response deadline; answering 202 and letting it finish");
+            Ok((StatusCode::ACCEPTED, Json(state.pending_control_snapshot(&id, &body.action))).into_response())
+        }
+    }
 }
 
 /// Returns bounded run logs, durable events, status, and PID.

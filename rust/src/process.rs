@@ -3,7 +3,7 @@ use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::logging::{KEEP_LOG_BYTES, MAX_LOG_BYTES, append_service_event, clear_run_log, run_log_path};
 use crate::models::ServiceRow;
-use crate::system::{ProcessTable, ancestors_of, command_targets_directory, delete_port_proxy_rules, service_working_directory, snapshot_listeners, snapshot_process_table, terminate_windows_pid, terminate_wsl_pid};
+use crate::system::{ProcessTable, ancestors_of, command_targets_directory, delete_port_proxy_rules, listeners_on_port, service_working_directory, snapshot_listeners, snapshot_process_table, terminate_windows_pid, terminate_wsl_pid};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -20,6 +20,12 @@ const PROTECTED_COMMAND_PATTERNS: [&str; 9] = ["terminal-daemon.cjs", "\\claude.
 /// Self-clearing so a stop that never produces an exit event cannot mislabel a later, unrelated
 /// death as requested. Matches the window the Node implementation used.
 const STOP_INTENT_WINDOW: Duration = Duration::from_secs(30);
+
+/// How long a stop waits for a killed listener to actually release its port before reporting it.
+const PORT_SETTLE_WINDOW: Duration = Duration::from_secs(4);
+
+/// Interval between port checks inside the settle window.
+const PORT_SETTLE_POLL: Duration = Duration::from_millis(500);
 
 /// Whether a tracked service was spawned here or adopted from an operating-system listener.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -147,13 +153,43 @@ impl ProcessSupervisor {
             }
         }
         sleep(Duration::from_millis(150)).await;
-        if let Some(port) = service.port.and_then(|value| u16::try_from(value).ok()) { self.free_exact_port(service, port).await?; }
+        // A termination that could not be run is reported rather than propagated (see
+        // `terminate_windows_pid`), so the stop has to establish for itself that the service is
+        // really down instead of trusting the kill. Freeing the port is the second attempt; the
+        // check after it is the evidence. A survivor is a Conflict rather than a silent success,
+        // because a stop that reports success while the old build still serves is how two deploys
+        // went out against the previous build without saying so (task-1974).
+        if let Some(port) = service.port.and_then(|value| u16::try_from(value).ok()) {
+            self.free_exact_port(service, port).await?;
+            if let Some(survivors) = self.port_survivors(port).await {
+                let detail = format!("Stop could NOT free port {port}: still held by PID(s) {}.", survivors.iter().map(u32::to_string).collect::<Vec<_>>().join(", "));
+                append_service_event(&self.config.runtime_root, &service.id, &detail)?;
+                return Err(AppError::Conflict(detail));
+            }
+        }
         self.tracked.write().insert(service.id.clone(), TrackedProcess { status: "stopped".into(), pid: None, wrapper_pid: None, kind: ProcessKind::WindowsAdopted });
         self.database.update_runtime(&service.id, "stopped", None)?;
         // Only note the stop here when the exit watcher did not already describe it, so a single
         // deliberate stop leaves one line rather than two that contradict each other.
         if self.take_stop_requested(&service.id) { append_service_event(&self.config.runtime_root, &service.id, "Process stopped after Service Manager requested it.")?; }
         Ok(self.status(&service.id).expect("stopped status was inserted"))
+    }
+
+    /// Returns the PIDs still listening on a port after a stop, once they have had time to die.
+    ///
+    /// `taskkill /F` returns before the process has finished exiting, so a single check straight
+    /// after it reads a listener that is already on its way out and would report a healthy stop as a
+    /// failure. The port is polled instead, and only a listener that is STILL there at the end of the
+    /// settle window counts. A probe that cannot be taken is not a survivor either - it is unknown,
+    /// and an unknown must not fail a stop that has done everything asked of it.
+    /// @param port - the service's exact registered port
+    async fn port_survivors(&self, port: u16) -> Option<Vec<u32>> {
+        let deadline = Instant::now() + PORT_SETTLE_WINDOW;
+        loop {
+            let holders = listeners_on_port(port).await.filter(|pids| !pids.is_empty());
+            if holders.is_none() || Instant::now() >= deadline { return holders; }
+            sleep(PORT_SETTLE_POLL).await;
+        }
     }
 
     /// Frees a service's exact registered port while blocking protected or foreign tracked PIDs.

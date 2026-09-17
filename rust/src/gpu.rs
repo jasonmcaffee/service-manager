@@ -152,6 +152,19 @@ pub async fn assert_vram_available(service: &ServiceRow, registered: Option<&str
     Ok(())
 }
 
+/// Reports whether a GPU orphan sweep could possibly find anything for this service.
+///
+/// A service pinned to no card, or whose command names no specific executable, has nothing the sweep
+/// can own, so `reap_owned_gpu_orphans` discards its inputs and returns an empty result. Answering
+/// that here lets a caller skip the two process-table snapshots the sweep needs - the dominant cost
+/// of a start (task-1974) - and keeps the condition in one place so the two cannot drift apart.
+/// @param service - the service about to be swept
+/// @param registered - the CUDA device registered for it in the active profile, if any
+pub fn gpu_sweep_could_reap(service: &ServiceRow, registered: Option<&str>) -> bool {
+    let pinned = effective_cuda_device(registered, &service.command).map(|value| parse_cuda_devices(&value)).unwrap_or_default();
+    !pinned.is_empty() && !command_executables(&service.command).is_empty()
+}
+
 /// Returns specific executable basenames a service command launches, excluding generic interpreters.
 pub fn command_executables(command: &str) -> HashSet<String> {
     let generic = ["python.exe", "python3.exe", "node.exe", "cmd.exe", "powershell.exe", "pwsh.exe", "wsl.exe", "bash.exe"];
@@ -202,9 +215,9 @@ fn describe_app(app: &GpuComputeApp) -> String {
 /// behind, who owns it, and what the card actually reads afterwards, because per-process VRAM is
 /// never reported on Windows WDDM so the card-level figure is the only honest measure.
 pub async fn reap_owned_gpu_orphans(service: &ServiceRow, registered: Option<&str>, all_services: &[ServiceRow], process_table: &ProcessTable, protected_pids: &HashSet<u32>) -> AppResult<Vec<String>> {
+    if !gpu_sweep_could_reap(service, registered) { return Ok(Vec::new()); }
     let devices = effective_cuda_device(registered, &service.command).map(|value| parse_cuda_devices(&value)).unwrap_or_default();
     let owned_names = command_executables(&service.command);
-    if devices.is_empty() || owned_names.is_empty() { return Ok(Vec::new()); }
     let apps = query_gpu_compute_apps().await;
     if apps.is_empty() { return Ok(Vec::new()); }
     let foreign = known_executables(all_services, &service.id);
@@ -253,6 +266,26 @@ mod tests {
     fn command_pin_parser_ignores_comments_and_placeholders() {
         assert_eq!(command_cuda_device("REM --cuda-device 0\nset CUDA_VISIBLE_DEVICES=%CUDA_DEVICE%\npython main.py"), None);
         assert_eq!(command_cuda_device("set CUDA_STRING=cuda1\nllama-server.exe -dev %CUDA_STRING%"), Some("1".into()));
+    }
+
+    /// Builds a service row whose command and registered device the sweep guard can be asked about.
+    /// @param command - the service's start command
+    fn service_with_command(command: &str) -> ServiceRow {
+        ServiceRow { id: "svc".into(), name: "Fixture".into(), description: None, command: command.into(), port: Some(45000), no_port: false, wsl: false, cuda_device: None, min_free_vram_mb: None, start_on_boot: false, pid: None, status: "stopped".into(), desired_status: "stopped".into(), created_at: String::new(), updated_at: String::new() }
+    }
+
+    /// The guard that lets a start skip two process-table snapshots must only skip a sweep that
+    /// would have found nothing, so it still says yes for every service the sweep really covers.
+    #[test]
+    fn sweep_guard_skips_only_services_the_sweep_would_discard() {
+        // Llama.cpp Server: pinned by its own command line and naming its own binary.
+        assert!(gpu_sweep_could_reap(&service_with_command("llama-server.exe -dev cuda1 --port 8080"), None));
+        // The same binary, pinned by the profile registration rather than the command.
+        assert!(gpu_sweep_could_reap(&service_with_command("llama-server.exe --port 8087"), Some("1")));
+        // AI Service: no card anywhere, so the sweep discards its inputs unread.
+        assert!(!gpu_sweep_could_reap(&service_with_command("cd C:\\jason\\dev\\prod\\ai-service\r\nnpm run start-prod"), None));
+        // Pinned, but every executable it names is a generic interpreter the sweep refuses to own.
+        assert!(!gpu_sweep_could_reap(&service_with_command("set CUDA_VISIBLE_DEVICES=0\r\nnode server.js"), None));
     }
 
     /// Multi-device masks are normalized and deduplicated.

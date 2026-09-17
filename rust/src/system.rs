@@ -182,16 +182,54 @@ pub fn ancestors_of(pid: u32, parent_by_pid: &HashMap<u32, u32>) -> Vec<u32> {
 }
 
 /// Terminates one exact Windows PID, optionally including only its recorded spawned tree.
+///
+/// A `taskkill.exe` that cannot be RUN - a failed spawn, or a probe that overran its ceiling while
+/// the box was saturated - used to propagate, and `stop` aborted on it with
+/// `{"error":"terminating exact Windows PID"}` and left the service running, so two deploys silently
+/// stayed on the old build (task-1974). The kill is attempted twice and then reported rather than
+/// propagated, because every caller does something afterwards that observes the real outcome: `stop`
+/// frees the service's port and then checks it, and the reconcile pass claims or releases the port on
+/// its next tick. A non-zero exit is not a failure at all - that is what taskkill returns for a PID
+/// that has already gone.
+/// @param pid - the exact process id to terminate
+/// @param tree - also terminate the recorded spawned tree beneath it
 pub async fn terminate_windows_pid(pid: u32, tree: bool) -> AppResult<()> {
-    let mut command = Command::new("taskkill.exe");
-    command.args(["/PID", &pid.to_string(), "/F"]);
-    if tree { command.arg("/T"); }
-    let output = run_probe(command, "terminating exact Windows PID").await?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        tracing::warn!(pid, tree, %detail, "exact Windows PID termination returned non-zero");
+    for attempt in 1..=TERMINATE_ATTEMPTS {
+        let mut command = Command::new("taskkill.exe");
+        command.args(["/PID", &pid.to_string(), "/F"]);
+        if tree { command.arg("/T"); }
+        match run_probe(command, "terminating exact Windows PID").await {
+            Ok(output) => {
+                if !output.status.success() {
+                    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    tracing::warn!(pid, tree, %detail, "exact Windows PID termination returned non-zero");
+                }
+                return Ok(());
+            }
+            Err(error) if attempt < TERMINATE_ATTEMPTS => {
+                tracing::warn!(pid, tree, attempt, %error, "could not run taskkill; retrying once");
+                tokio::time::sleep(TERMINATE_RETRY_DELAY).await;
+            }
+            Err(error) => tracing::error!(pid, tree, %error, "could not run taskkill at all; leaving the outcome to the caller's own port check"),
+        }
     }
     Ok(())
+}
+
+/// How many times a termination is attempted before its outcome is left to the caller's own checks.
+const TERMINATE_ATTEMPTS: u32 = 2;
+
+/// Pause between termination attempts, long enough for a transient spawn failure to clear.
+const TERMINATE_RETRY_DELAY: Duration = Duration::from_millis(400);
+
+/// Returns the PIDs still LISTENING on one exact port, or None when the probe could not be taken.
+///
+/// `stop` uses this to check what actually happened rather than trusting a kill it could not verify.
+/// A failed probe is deliberately None and not an empty map: "nobody is listening" and "I could not
+/// look" must never read the same.
+/// @param port - the exact port to check
+pub async fn listeners_on_port(port: u16) -> Option<Vec<u32>> {
+    windows_listeners().await.ok().map(|listeners| listeners.get(&port).cloned().unwrap_or_default())
 }
 
 /// Terminates one exact WSL PID with TERM followed by a bounded KILL fallback.

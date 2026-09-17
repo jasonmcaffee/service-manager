@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
-use crate::gpu::{assert_vram_available, cuda_device_conflict, command_cuda_device, effective_cuda_device, parse_cuda_devices, reap_owned_gpu_orphans};
+use crate::gpu::{assert_vram_available, cuda_device_conflict, command_cuda_device, effective_cuda_device, gpu_sweep_could_reap, parse_cuda_devices, reap_owned_gpu_orphans};
 use crate::logging::{append_service_event, cap_all_run_logs, read_run_log_from, read_service_events, run_log_path, run_log_size};
 use crate::metrics::Metrics;
 use crate::models::{ConfigSnapshot, ProfileOverrideMutation, ProfileView, ServiceMutation, ServiceRow, ServiceView};
@@ -175,6 +175,49 @@ impl AppState {
         let result = self.start_service(service_id).await?;
         self.metrics.note_restart();
         Ok(result)
+    }
+
+    /// Runs one lifecycle action on a task that the calling connection cannot cancel.
+    ///
+    /// The control handler used to await `start_service` inside the request future, so a caller that
+    /// gave up took the action down with it: hyper drops the connection task when the client
+    /// disconnects, that drops the handler future, and the start was cancelled at whatever await it
+    /// had reached. `deploy-prod.ps1` gave up after 30s on a cutover start that the loaded box needed
+    /// longer than that for, and the abort landed after `start_service` had recorded
+    /// `desiredStatus: running` but before the wrapper was spawned, leaving prod `stopped` with no PID
+    /// and no auto-restart to recover it - three measured outages on task-1974. Owning the work here
+    /// means a caller timeout can only lose the ANSWER, never the action.
+    /// @param service_id - the service the action applies to
+    /// @param action - `start`, `stop`, or `restart`, already validated by the caller
+    pub fn spawn_control_action(&self, service_id: &str, action: &str) -> tokio::task::JoinHandle<AppResult<serde_json::Value>> {
+        let state = self.clone();
+        let service_id = service_id.to_owned();
+        let action = action.to_owned();
+        tokio::spawn(async move {
+            match action.as_str() {
+                "start" => state.start_service(&service_id).await,
+                "stop" => state.stop_service(&service_id).await,
+                "restart" => state.restart_service(&service_id).await,
+                other => Err(AppError::BadRequest(format!("Invalid action {other}"))),
+            }
+        })
+    }
+
+    /// Describes a lifecycle action that is still running, using the status already persisted for it.
+    ///
+    /// Answering an unfinished action needs a status a caller can act on rather than an invented one,
+    /// so this reports what the manager currently believes about the process. `start` writes
+    /// `starting` to the database before it spawns, so a slow start reads as `starting` here.
+    /// @param service_id - the service whose action is still running
+    /// @param action - the action that has not finished yet
+    pub fn pending_control_snapshot(&self, service_id: &str, action: &str) -> serde_json::Value {
+        let tracked = self.processes.status(service_id);
+        let row = self.database.get_service(service_id).ok().flatten();
+        let status = tracked.as_ref().map(|value| value.status.clone())
+            .or_else(|| row.as_ref().map(|value| value.status.clone()))
+            .unwrap_or_else(|| "starting".into());
+        let pid = tracked.and_then(|value| value.pid).map(i64::from).or_else(|| row.and_then(|value| value.pid));
+        serde_json::json!({"id":service_id,"status":status,"pid":pid,"accepted":true,"action":action})
     }
 
     /// Starts each active-profile boot service once and skips adopted/running entries.
@@ -396,7 +439,14 @@ impl AppState {
     }
 
     /// Performs the scoped GPU orphan sweep and writes each decision to durable service events.
+    ///
+    /// The two snapshots below are the most expensive thing in a start (a PowerShell `Get-CimInstance
+    /// Win32_Process` measures 396ms idle and is capped at 8s), and `reap_owned_gpu_orphans` discards
+    /// both immediately for a service that is pinned to no card or launches no named executable - which
+    /// is most of them, `AI Service` included. Deciding that here took the start path from five
+    /// process-table snapshots to three, and its worst case from about 40s to about 24s (task-1974).
     async fn reap_gpu_orphans(&self, service: &ServiceRow, registered: Option<&str>) -> AppResult<Vec<String>> {
+        if !gpu_sweep_could_reap(service, registered) { return Ok(Vec::new()); }
         let table = snapshot_process_table().await?;
         let protected = self.processes.protected_pids(service).await?;
         let notes = reap_owned_gpu_orphans(service, registered, &self.database.list_services()?, &table, &protected).await?;
